@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1"
+  >
+
+  <meta name="theme-color" content="#081723">
+
+  <meta
+    name="description"
+    content="실버스타 스포츠 과학원 CODEON MOTION — 웨이트 자세분석과 선수별 운동 기록"
+  >
+
+  <title>실버스타 스포츠 과학원 · CODEON MOTION</title>
+
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+  <!-- 왼쪽 메뉴 -->
+  <aside id="sidebar">
+    <a
+      class="brand"
+      href="#home"
+      aria-label="실버스타 스포츠 과학원 홈"
+    >
+      <span class="brandmark" aria-hidden="true">S✦</span>
+
+      <strong>
+        실버스타<br>
+        스포츠 과학원
+      </strong>
+
+      <small>CODEON MOTION</small>
+    </a>
+
+    <!-- 메뉴 항목은 app.js에서 연결됩니다. -->
+    <nav
+      id="nav"
+      aria-label="주 메뉴"
+    ></nav>
+
+    <div class="sidebar-foot">
+      ATHLETE SCIENCE
+
+      <br>
+
+      <small>
+        2D 영상 분석 · 기기 내 저장
+      </small>
+    </div>
+  </aside>
+
+  <!-- 프로그램 본문 -->
+  <div id="shell">
+    <header>
+      <button
+        id="menu"
+        type="button"
+        aria-label="메뉴 열기"
+        aria-controls="sidebar"
+        aria-expanded="false"
+      >
+        ☰
+      </button>
+
+      <div>
+        <strong>실버스타 스포츠 과학원</strong>
+
+        <small>
+          STRENGTH · MOVEMENT · INSIGHT
+        </small>
+      </div>
+
+      <span class="badge">
+        개발 버전 1.0
+      </span>
+    </header>
+
+    <!--
+      각 화면은 해당 JavaScript 파일에서 이 영역에 표시합니다.
+
+      대시보드       : app.js
+      선수 관리      : athletes.js
+      운동 목록      : exercises.js
+      자세 분석      : analysis.js
+      비교 분석      : compare.js
+      분석 리포트    : reports.js
+      추가 훈련      : training.js
+    -->
+    <main id="main">
+      <div class="panel">
+        <div class="eyebrow">CODEON MOTION</div>
+
+        <h1>프로그램을 불러오는 중입니다.</h1>
+
+        <p class="muted">
+          화면이 바뀌지 않으면 나머지 코드 파일이
+          같은 폴더에 있는지 확인해 주세요.
+        </p>
+      </div>
+    </main>
+
+    <footer>
+      측정값은 영상의 2D 투영값입니다.
+      촬영 방향과 가림에 따라 오차가 발생합니다.
+    </footer>
+  </div>
+
+  <!-- 저장 완료·오류 등 공통 안내 -->
+  <div
+    id="toast"
+    role="status"
+    aria-live="polite"
+    aria-atomic="true"
+  ></div>
+
+  <!-- 선수등록·운동등록 등에 사용하는 공통 창 -->
+  <dialog
+    id="modal"
+    aria-label="정보 입력 및 상세 보기"
+  >
+    <div id="modal-body"></div>
+
+    <button
+      id="modal-close"
+      type="button"
+    >
+      닫기
+    </button>
+  </dialog>
+
+  <noscript>
+    이 프로그램을 사용하려면 브라우저에서
+    JavaScript를 활성화해야 합니다.
+  </noscript>
+
+  <!-- 순서를 바꾸지 마세요. -->
+  <script src="storage.js"></script>
+  <script src="exercises.js"></script>
+  <script src="charts.js"></script>
+  <script src="athletes.js"></script>
+  <script src="analysis.js"></script>
+  <script src="compare.js"></script>
+  <script src="reports.js"></script>
+  <script src="training.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
