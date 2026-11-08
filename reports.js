@@ -1,39 +1,82 @@
-/* 실버스타 스포츠 과학원 · CODEON MOTION
-   reports.js
+/*
+  실버스타 스포츠 과학원 · CODEON MOTION
+  reports.js — 통합 교체본
 
-   자동 리포트:
-   - 관절 변화 / 좌우 비교
-   - 반복별 가동범위 / 수행 시간
-   - 자동 육각형 / 산식 공개
-   - 측정 근거 기반 자동 코치 의견
-   - 코치 메모 / 추가 훈련 연결
-   - CSV / 인쇄
+  - 자동 리포트
+  - 육각형 참고 지표
+  - 부위 / 좌우 / 시간 구간 선택
+  - 각도 / 위치 꺾은선
+  - 반복별 막대 / 반복 곡선 비교
+  - 손목 / 발목 / 골반 궤적
+  - 저장 스켈레톤 시점 확인
+  - 원본 영상에서 자동 사진 추출
+  - 논문 비교 참고 자료
+  - 코치 메모 / 훈련 연결 / CSV / 인쇄
 
-   점수는 동작의 일관성과 기록 상태를 표현합니다.
-   임상 평가, 근력 평가, 부상 진단 점수가 아닙니다.
+  모든 통계는 저장된 원본 측정값으로 계산합니다.
+  보기용 평균선은 원본 기록이나 점수를 수정하지 않습니다.
 */
 
 (() => {
   "use strict";
 
-  window.CM = window.CM || {};
-  const CM = window.CM;
-
-  const esc = value => CM.escape(String(value ?? ""));
+  const CM = window.CM = window.CM || {};
   const finite = Number.isFinite;
-  const clamp = value => Math.max(0, Math.min(100, value));
+  const esc = value => CM.escape(String(value ?? ""));
+  const clamp = (value, min, max) =>
+    Math.max(min, Math.min(max, value));
 
-  const joints = {
-    knee: "무릎",
-    hip: "고관절",
-    ankle: "발목",
+  const jointNames = {
+    shoulder: "어깨",
     elbow: "팔꿈치",
-    shoulder: "어깨"
+    hip: "고관절",
+    knee: "무릎",
+    ankle: "발목"
   };
 
+  const partNames = {
+    ...jointNames,
+    wrist: "손목",
+    trunk: "몸통",
+    pelvis: "골반"
+  };
+
+  const pointIds = {
+    shoulder: { left: 11, right: 12 },
+    elbow: { left: 13, right: 14 },
+    wrist: { left: 15, right: 16 },
+    hip: { left: 23, right: 24 },
+    knee: { left: 25, right: 26 },
+    ankle: { left: 27, right: 28 }
+  };
+
+  const triples = {
+    shoulder: { left: [23, 11, 13], right: [24, 12, 14] },
+    elbow: { left: [11, 13, 15], right: [12, 14, 16] },
+    hip: { left: [11, 23, 25], right: [12, 24, 26] },
+    knee: { left: [23, 25, 27], right: [24, 26, 28] },
+    ankle: { left: [25, 27, 31], right: [26, 28, 32] }
+  };
+
+  const edges = [
+    [11, 12], [11, 13], [13, 15],
+    [12, 14], [14, 16],
+    [11, 23], [12, 24], [23, 24],
+    [23, 25], [25, 27],
+    [24, 26], [26, 28],
+    [27, 29], [29, 31], [27, 31],
+    [28, 30], [30, 32], [28, 32]
+  ];
+
+  const leftIds = new Set([11, 13, 15, 23, 25, 27, 29, 31]);
+  const colors = [
+    "#50daf2", "#f58cce", "#f5d76e", "#8ce5ac",
+    "#b8a1ff", "#ffad75", "#7db5ff", "#dddddd"
+  ];
+
   CM.reportViewNames = {
-    side: "측면",
     front: "정면",
+    side: "측면",
     back: "후면"
   };
 
@@ -42,83 +85,78 @@
     "템포 일관성",
     "좌우 각도 유사도",
     "몸통 움직임 일관성",
-    "선택 관절 관측률",
+    "관절 관측률",
     "목표 반복 달성"
   ];
 
   const fmt = (value, digits = 1) =>
     finite(value) ? value.toFixed(digits) : "—";
 
-  function mean(values) {
-    const valid = values.filter(finite);
-    if (!valid.length) return null;
-    return valid.reduce((sum, value) => sum + value, 0) /
-      valid.length;
-  }
-
   function stats(values) {
-    const valid = values.filter(finite);
-
-    if (!valid.length) {
-      return { n: 0, min: null, max: null, mean: null, range: null };
-    }
-
     let min = Infinity;
     let max = -Infinity;
     let sum = 0;
+    let count = 0;
 
-    for (const value of valid) {
+    for (const value of values) {
+      if (!finite(value)) continue;
       min = Math.min(min, value);
       max = Math.max(max, value);
       sum += value;
+      count++;
     }
 
-    return {
-      n: valid.length,
-      min,
-      max,
-      mean: sum / valid.length,
-      range: max - min
-    };
-  }
-
-  function sd(values) {
-    const average = mean(values);
-    if (average === null) return null;
-
-    return Math.sqrt(
-      values.reduce(
-        (sum, value) => sum + (value - average) ** 2,
-        0
-      ) / values.length
-    );
+    return count
+      ? { min, max, mean: sum / count, range: max - min, count }
+      : { min: null, max: null, mean: null, range: null, count: 0 };
   }
 
   function consistency(values) {
-    if (values.length < 3) return null;
+    const valid = values.filter(finite);
+    if (valid.length < 3) return null;
 
-    const average = mean(values);
-    if (!finite(average) || average <= 0) return null;
+    const mean = stats(valid).mean;
+    if (!finite(mean) || mean <= 0) return null;
 
-    return clamp(100 * (1 - sd(values) / average));
+    const variance = valid.reduce(
+      (sum, value) => sum + (value - mean) ** 2,
+      0
+    ) / valid.length;
+
+    return clamp(100 * (1 - Math.sqrt(variance) / mean), 0, 100);
   }
 
-  CM.recordSamples = record =>
-    (Array.isArray(record.samples) ? record.samples : [])
-      .filter(sample => finite(sample?.t))
-      .slice()
-      .sort((a, b) => a.t - b.t);
+  function validPoint(point, threshold = 0.55) {
+    return Boolean(
+      point &&
+      finite(point.x) &&
+      finite(point.y) &&
+      (
+        point.manual ||
+        (finite(point.visibility) && point.visibility >= threshold)
+      )
+    );
+  }
+
+  CM.recordSamples = record => {
+    const unique = new Map();
+
+    for (const sample of record.samples || []) {
+      if (finite(sample?.t)) unique.set(sample.t, sample);
+    }
+
+    return [...unique.values()].sort((a, b) => a.t - b.t);
+  };
 
   CM.reportRecordLabel = record => {
     const date = new Date(record.createdAt || record.date);
-    const label = finite(date.getTime())
-      ? date.toLocaleString("ko-KR")
-      : "날짜 없음";
+    const dateLabel = finite(date.getTime())
+      ? date.toLocaleString("ko-KR") : "날짜 없음";
 
     return [
       record.athleteName || "게스트",
       record.exercise?.name || "운동",
-      label
+      dateLabel
     ].join(" · ");
   };
 
@@ -129,402 +167,269 @@
       (b.exerciseId || b.exercise?.id) &&
     a.view === b.view &&
     a.measurementVersion === b.measurementVersion &&
-    a.angleDefinition === b.angleDefinition;
+    a.angleDefinition === b.angleDefinition &&
+    (a.poseConfig?.model || "") === (b.poseConfig?.model || "") &&
+    (a.poseConfig?.visibilityThreshold ?? 0.55) ===
+      (b.poseConfig?.visibilityThreshold ?? 0.55);
 
   CM.csvCell = value => {
     if (finite(value)) return String(value);
 
     let text = String(value ?? "");
-
-    if (/^[=+\-@\t\r]/.test(text)) {
-      text = "'" + text;
-    }
-
+    if (/^[=+\-@\t\r]/.test(text)) text = "'" + text;
     return `"${text.replace(/"/g, '""')}"`;
   };
 
   CM.exportRecordCSV = record => {
-    const keys = Object.keys(joints).flatMap(joint => [
-      `left_${joint}`,
-      `right_${joint}`
+    const angleKeys = Object.keys(jointNames).flatMap(joint => [
+      `left_${joint}`, `right_${joint}`
     ]);
 
     const metricKeys = [
-      "left_trunk",
-      "right_trunk",
-      "shoulderTilt",
-      "hipTilt",
-      "pelvisX",
-      "pelvisY",
-      "left_kneeToe",
-      "right_kneeToe"
+      "left_trunk", "right_trunk",
+      "shoulderTilt", "hipTilt",
+      "pelvisX", "pelvisY",
+      "left_kneeToe", "right_kneeToe"
     ];
 
     const rows = [
       [
-        "시간_s",
-        ...keys,
-        ...metricKeys,
-        "수동수정",
-        "바벨_x",
-        "바벨_y"
+        "시간_s", ...angleKeys, ...metricKeys,
+        "수동수정", "인식상태", "바벨_x", "바벨_y"
       ],
       ...CM.recordSamples(record).map(sample => [
         sample.t,
-        ...keys.map(key => sample.angles?.[key]),
+        ...angleKeys.map(key => sample.angles?.[key]),
         ...metricKeys.map(key => sample.metrics?.[key]),
         sample.manual ? "예" : "아니오",
+        sample.quality?.status || "",
         sample.bar?.x,
         sample.bar?.y
       ])
     ];
 
-    const csv = "\uFEFF" + rows.map(row =>
-      row.map(CM.csvCell).join(",")
-    ).join("\r\n");
-
     CM.download(
-      `codeon-analysis-${record.id}.csv`,
-      csv,
+      `codeon-${record.id}.csv`,
+      "\uFEFF" + rows.map(row =>
+        row.map(CM.csvCell).join(",")
+      ).join("\r\n"),
       "text/csv;charset=utf-8"
     );
   };
 
-  function valueOf(sample, joint, side) {
-    return sample.angles?.[`${side}_${joint}`];
+  function angle(sample, joint, side) {
+    const value = sample.angles?.[`${side}_${joint}`];
+    return finite(value) ? value : null;
   }
 
-  function trunkOf(sample, side) {
-    return sample.metrics?.[`${side}_trunk`];
+  function metric(sample, key) {
+    const value = sample.metrics?.[key];
+    return finite(value) ? value : null;
   }
 
-  function validRepetitions(record) {
-    return (Array.isArray(record.repetitions)
-      ? record.repetitions
-      : []
-    ).filter(rep =>
-      finite(rep.start) &&
-      finite(rep.end) &&
-      rep.end > rep.start
-    );
+  function point(sample, id, threshold = 0.55) {
+    const candidate = sample.points?.[id];
+    return validPoint(candidate, threshold) ? candidate : null;
   }
 
-  /*
-    반복 구간의 첫/마지막 측정이 경계에서 0.25초 이내이고,
-    중간 측정 공백이 0.8초 이하일 때만 범위를 계산합니다.
-  */
-  function intervalRange(samples, start, end, getter) {
-    const selected = samples.filter(sample =>
-      sample.t >= start &&
-      sample.t <= end &&
-      finite(getter(sample))
-    );
-
-    if (selected.length < 3) return null;
-    if (selected[0].t - start > 0.25) return null;
-    if (end - selected[selected.length - 1].t > 0.25) return null;
-
-    for (let i = 1; i < selected.length; i++) {
-      if (selected[i].t - selected[i - 1].t > 0.8) {
-        return null;
-      }
-    }
-
-    return stats(selected.map(getter)).range;
-  }
-
-  function buildMetrics(record, samples, joint, side) {
-    const reps = validRepetitions(record);
-
-    const repetitionRows = reps.map((rep, index) => ({
-      index: index + 1,
-      start: rep.start,
-      end: rep.end,
-      duration: rep.end - rep.start,
-      rom: intervalRange(
-        samples,
-        rep.start,
-        rep.end,
-        sample => valueOf(sample, joint, side)
-      ),
-      trunkRange: intervalRange(
-        samples,
-        rep.start,
-        rep.end,
-        sample => trunkOf(sample, side)
-      )
-    }));
-
-    const roms = repetitionRows.map(row => row.rom).filter(finite);
-    const durations = repetitionRows.map(row => row.duration);
-    const trunks = repetitionRows
-      .map(row => row.trunkRange)
-      .filter(finite);
-
-    const paired = samples.filter(sample =>
-      finite(valueOf(sample, joint, "left")) &&
-      finite(valueOf(sample, joint, "right"))
-    );
-
-    const differences = paired.map(sample =>
-      Math.abs(
-        valueOf(sample, joint, "left") -
-        valueOf(sample, joint, "right")
-      )
-    );
-
-    const diffMean = mean(differences);
-    const validCount = samples.filter(sample =>
-      finite(valueOf(sample, joint, side))
-    ).length;
-
-    const coverage = samples.length
-      ? 100 * validCount / samples.length
-      : null;
-
-    const target = Number(record.targetReps);
-    const bilateralView = ["front", "back"].includes(record.view);
-
-    // 좌우 각도 유사도는 사용자 참고용 선형 변환입니다.
-    // 평균 차이 0° = 100, 30° 이상 = 0.
-    // 30°는 의학적 허용치가 아닙니다.
-    const bilateralScore =
-      bilateralView && paired.length >= 10
-        ? clamp(100 * (1 - diffMean / 30))
-        : null;
-
-    const targetScore =
-      record.exercise?.mode === "reps" &&
-      finite(target) &&
-      target > 0
-        ? clamp(100 * reps.length / target)
-        : null;
-
-    const axes = [
-      {
-        name: CM.reportAxes[0],
-        value: consistency(roms)
-      },
-      {
-        name: CM.reportAxes[1],
-        value: consistency(durations)
-      },
-      {
-        name: CM.reportAxes[2],
-        value: bilateralScore
-      },
-      {
-        name: CM.reportAxes[3],
-        value: consistency(trunks)
-      },
-      {
-        name: CM.reportAxes[4],
-        value: samples.length >= 10 ? coverage : null
-      },
-      {
-        name: CM.reportAxes[5],
-        value: targetScore
-      }
-    ];
+  function center(sample, ids, threshold = 0.55) {
+    const selected = ids.map(id => point(sample, id, threshold));
+    if (selected.some(item => !item)) return null;
 
     return {
-      axes,
-      repetitionRows,
-      reps,
-      roms,
-      durations,
-      paired,
-      diffMean,
-      differences,
-      coverage,
-      validCount,
-      bilateralView,
-      left: stats(samples.map(sample =>
-        valueOf(sample, joint, "left")
-      )),
-      right: stats(samples.map(sample =>
-        valueOf(sample, joint, "right")
-      ))
+      x: selected.reduce((sum, item) => sum + item.x, 0) / ids.length,
+      y: selected.reduce((sum, item) => sum + item.y, 0) / ids.length
     };
   }
 
-  /*
-    자동 코치 의견은 측정값을 문장으로 설명합니다.
-    특정 자세를 정상/비정상으로 진단하지 않습니다.
-  */
-  function buildFeedback(record, metrics, joint, side) {
-    const notes = [];
-    const drills = [];
-    const jointName = joints[joint];
-    const sideName = side === "left" ? "왼쪽" : "오른쪽";
-    const selected = metrics[side];
+  function partPoint(sample, part, side, threshold = 0.55) {
+    if (part === "pelvis") return center(sample, [23, 24], threshold);
 
-    if (selected.n) {
-      notes.push({
-        title: `${sideName} ${jointName} 움직임`,
-        text:
-          `관측 각도는 ${fmt(selected.min)}~` +
-          `${fmt(selected.max)}°이며, 전체 기록의 변화 폭은 ` +
-          `${fmt(selected.range)}°입니다. ` +
-          "준비 자세와 휴식 구간도 포함된 값이므로 " +
-          "반복별 그래프와 함께 확인하세요."
-      });
-    } else {
-      notes.push({
-        title: "측정 부족",
-        text:
-          `${sideName} ${jointName} 각도를 확인할 수 없습니다. ` +
-          "촬영 구도와 관절 가림을 확인한 뒤 다시 분석하세요."
-      });
+    if (part === "trunk") {
+      return center(
+        sample,
+        side === "left" ? [11, 23] : [12, 24],
+        threshold
+      );
     }
 
-    if (metrics.roms.length >= 3) {
-      const rom = stats(metrics.roms);
+    return point(sample, pointIds[part][side], threshold);
+  }
 
-      notes.push({
-        title: "반복별 가동범위",
-        text:
-          `${metrics.roms.length}개 유효 반복의 평균 변화 폭은 ` +
-          `${fmt(rom.mean)}°이고, 반복 간 최댓값과 최솟값의 차이는 ` +
-          `${fmt(rom.range)}°입니다. ` +
-          "의도한 동작 깊이가 반복마다 같았는지 영상을 확인하세요."
-      });
-
-      drills.push({
-        title: "동작 범위 확인 연습",
-        text:
-          `${record.exercise?.name || "선택 운동"}의 ` +
-          "시작·종료 위치를 화면 기준선으로 확인하며 " +
-          "같은 범위를 의도적으로 반복해 보세요. " +
-          "목표 각도와 횟수는 코치와 정하세요."
-      });
-    } else {
-      notes.push({
-        title: "반복 비교 자료 부족",
-        text:
-          "가동범위 일관성을 계산하려면 측정 공백이 적은 " +
-          "유효 반복이 3개 이상 필요합니다. " +
-          "자동 반복 구간이 실제 동작과 일치하는지도 확인하세요."
-      });
+  function partValue(sample, part, side, mode, threshold) {
+    if (mode !== "angle") {
+      const p = partPoint(sample, part, side, threshold);
+      return p ? (mode === "x" ? p.x : p.y) * 100 : null;
     }
 
-    if (metrics.durations.length >= 3) {
-      const timing = stats(metrics.durations);
+    if (part === "wrist") return null;
 
-      notes.push({
-        title: "반복 속도",
-        text:
-          `반복 시간은 평균 ${fmt(timing.mean, 2)}초, ` +
-          `최소 ${fmt(timing.min, 2)}초, ` +
-          `최대 ${fmt(timing.max, 2)}초입니다. ` +
-          "속도를 일정하게 수행하는 과제였다면 " +
-          "차이가 큰 반복을 다시 확인하세요."
-      });
+    const required = part === "pelvis"
+      ? [23, 24]
+      : part === "trunk"
+        ? side === "left" ? [11, 23] : [12, 24]
+        : triples[part][side];
 
-      drills.push({
-        title: "일정한 템포 연습",
-        text:
-          "코치가 정한 박자에 맞춰 같은 운동을 수행하고 " +
-          "다시 촬영해 반복 시간을 비교하세요. " +
-          "빠르게 수행해야 하는 점프 종목에는 " +
-          "느린 템포를 일괄 적용하지 않습니다."
-      });
+    if (!required.every(id => point(sample, id, threshold))) return null;
+
+    if (part === "pelvis") return metric(sample, "hipTilt");
+    if (part === "trunk") return metric(sample, `${side}_trunk`);
+    return angle(sample, part, side);
+  }
+
+  function validReps(record) {
+    return (record.repetitions || [])
+      .filter(rep =>
+        finite(rep.start) &&
+        finite(rep.end) &&
+        rep.end > rep.start
+      )
+      .slice()
+      .sort((a, b) => a.start - b.start);
+  }
+
+  function repRange(samples, rep, getter) {
+    const selected = samples.filter(sample =>
+      sample.t >= rep.start && sample.t <= rep.end
+    );
+
+    const valid = selected.filter(sample => finite(getter(sample)));
+
+    if (valid.length < 3 || !selected.length) return null;
+    if (valid.length / selected.length < 0.7) return null;
+    if (valid[0].t - rep.start > 0.25) return null;
+    if (rep.end - valid[valid.length - 1].t > 0.25) return null;
+
+    for (let index = 1; index < valid.length; index++) {
+      if (valid[index].t - valid[index - 1].t > 0.8) return null;
     }
 
-    if (metrics.bilateralView && metrics.paired.length >= 10) {
-      const differences = stats(metrics.differences);
+    return stats(valid.map(getter)).range;
+  }
 
-      notes.push({
-        title: "좌우 차이 확인",
-        text:
-          `같은 시점의 좌우 ${jointName} 각도 차이는 평균 ` +
-          `${fmt(metrics.diffMean)}°, 최대 ` +
-          `${fmt(differences.max)}°입니다. ` +
-          "교대·편측 운동에서는 의도한 차이일 수 있고, " +
-          "카메라 위치와 가림도 영향을 줍니다. " +
-          "이 값만으로 약한 쪽을 정할 수는 없습니다."
-      });
+  function smooth(data) {
+    const output = data.map(item => ({ ...item }));
+    let start = 0;
 
-      drills.push({
-        title: "좌우 비교 재촬영",
-        text:
-          "카메라를 몸 중앙에 맞추고 같은 구도에서 " +
-          "좌우 동작을 각각 촬영하세요. " +
-          "같은 동작 단계끼리 비교한 뒤 추가 훈련을 선택하세요."
-      });
-    } else {
-      notes.push({
-        title: "좌우 평가 보류",
-        text:
-          "측면 촬영이거나 양쪽 관절의 동시 측정값이 부족해 " +
-          "좌우 유사도 점수를 만들지 않았습니다."
-      });
+    while (start < data.length) {
+      if (!finite(data[start].y)) {
+        start++;
+        continue;
+      }
+
+      let end = start;
+
+      while (
+        end + 1 < data.length &&
+        finite(data[end + 1].y) &&
+        data[end + 1].x - data[end].x <= 0.8
+      ) end++;
+
+      for (let index = start; index <= end; index++) {
+        const from = Math.max(start, index - 2);
+        const to = Math.min(end, index + 2);
+        let sum = 0;
+
+        for (let cursor = from; cursor <= to; cursor++) {
+          sum += data[cursor].y;
+        }
+
+        output[index].y = sum / (to - from + 1);
+      }
+
+      start = end + 1;
     }
 
-    if (finite(metrics.coverage)) {
-      notes.push({
-        title: "기록의 관측 상태",
-        text:
-          `저장된 ${metrics.validCount}개 유효 표본을 기준으로 ` +
-          `선택 관절 관측률은 ${fmt(metrics.coverage)}%입니다. ` +
-          "전체 영상 프레임의 분석률이나 측정 정확도를 뜻하지 않습니다."
-      });
-    }
-
-    if (finite(metrics.axes[5].value)) {
-      notes.push({
-        title: "목표 반복",
-        text:
-          `목표 ${record.targetReps}회 중 ` +
-          `${metrics.reps.length}개 반복 구간이 저장되어 있습니다. ` +
-          "자동 감지 결과라면 실제 횟수와 일치하는지 확인하세요."
-      });
-    }
-
-    if (!drills.length) {
-      drills.push({
-        title: "분석 가능한 기록 만들기",
-        text:
-          "분석할 관절이 화면 안에 충분히 보이도록 촬영하고, " +
-          "실제 동작에 맞게 반복 구간을 확인하세요."
-      });
-    }
-
-    return { notes, drills };
+    return output;
   }
 
   CM.reportObservations = (samples, joint = "knee") => {
     const paired = samples.filter(sample =>
-      finite(sample.angles?.[`left_${joint}`]) &&
-      finite(sample.angles?.[`right_${joint}`])
+      finite(angle(sample, joint, "left")) &&
+      finite(angle(sample, joint, "right"))
     );
 
     return {
-      left: stats(samples.map(sample =>
-        sample.angles?.[`left_${joint}`]
-      )),
-      right: stats(samples.map(sample =>
-        sample.angles?.[`right_${joint}`]
-      )),
+      left: stats(samples.map(sample => angle(sample, joint, "left"))),
+      right: stats(samples.map(sample => angle(sample, joint, "right"))),
       pairedCount: paired.length,
-      meanDifference: mean(paired.map(sample =>
+      meanDifference: stats(paired.map(sample =>
         Math.abs(
-          sample.angles[`left_${joint}`] -
-          sample.angles[`right_${joint}`]
+          angle(sample, joint, "left") -
+          angle(sample, joint, "right")
         )
-      ))
+      )).mean
     };
   };
 
-  CM.renderReports = async () => {
-    // 같은 화면을 다시 그릴 때 이전 이벤트를 해제합니다.
-    if (typeof CM.reportsCleanup === "function") {
-      CM.reportsCleanup();
+  function papersFor(record) {
+    const name = record.exercise?.name || "";
+    const icon = record.exercise?.icon;
+
+    if (icon === "squat" || /스쿼트|스쾃|squat/i.test(name)) {
+      return [
+        {
+          name: "Fry 외 · 2003",
+          url: "https://pubmed.ncbi.nlm.nih.gov/14636100/",
+          subjects: "성인 남성 7명 · 평행 바벨 스쿼트",
+          result:
+            "무릎 전진 제한 여부에 따라 무릎과 고관절 토크가 달라졌습니다.",
+          compare:
+            "무릎 전진과 몸통 움직임을 함께 확인하는 참고 자료입니다.",
+          limit:
+            "현재 영상 각도만으로 실제 토크나 정상·비정상을 계산하지 않습니다."
+        },
+        {
+          name: "백 스쿼트 반복측정 연구 · 2025",
+          url: "https://pubmed.ncbi.nlm.nih.gov/40157154/",
+          subjects: "건강한 참가자 16명 · 백 스쿼트",
+          result:
+            "몸통·정강이 상대 기울기와 무릎 굽힘이 " +
+            "고관절·무릎 모멘트 비율과 관련되었습니다.",
+          compare:
+            "몸통 각도 하나만 보지 않고 여러 관절을 함께 비교합니다.",
+          limit:
+            "앱의 2D 측정 방법과 연구의 측정 방법은 동일하지 않습니다."
+        }
+      ];
     }
 
+    if (icon === "pushup" || /푸시업|푸쉬업|팔굽혀|push.?up/i.test(name)) {
+      return [
+        {
+          name: "Donkers 외 · 1993",
+          url: "https://pubmed.ncbi.nlm.nih.gov/8514808/",
+          subjects: "건강한 성인 남성 9명 · 여러 손 위치",
+          result:
+            "손 위치에 따라 푸시업 중 팔꿈치의 힘과 토크가 달라졌습니다.",
+          compare:
+            "손 위치가 다른 영상을 같은 조건으로 취급하지 않습니다.",
+          limit:
+            "특정 팔꿈치 각도 하나를 모든 사람의 정답으로 제시하지 않습니다."
+        },
+        {
+          name: "Ebben 외 · 2011",
+          url: "https://pubmed.ncbi.nlm.nih.gov/21873902/",
+          subjects: "성인 23명 · 푸시업 변형 비교",
+          result:
+            "손을 높이거나 무릎을 댄 변형에서 최대 수직 지면반력이 낮았습니다.",
+          compare:
+            "지지 높이와 운동 변형을 구분해 비교합니다.",
+          limit:
+            "앱은 지면반력이나 개인의 부상 위험을 측정하지 않습니다."
+        }
+      ];
+    }
+
+    return [];
+  }
+
+  CM.renderReports = async () => {
+    CM.reportsCleanup?.();
     await CM.loadExercises();
 
     const records = await CM.db.all("records");
+
     records.sort((a, b) =>
       (Date.parse(b.createdAt || b.date) || 0) -
       (Date.parse(a.createdAt || a.date) || 0)
@@ -534,121 +439,243 @@
 
     if (!records.length) {
       main.innerHTML =
-        CM.heading("분석 리포트", "AUTOMATIC REPORT") +
-        CM.empty("분석 화면에서 기록을 저장하면 리포트가 생성됩니다.");
+        CM.heading("분석 리포트", "SILVERSTAR · AUTOMATIC REPORT") +
+        CM.empty("분석 화면에서 측정값을 저장하면 리포트가 생성됩니다.");
       return;
     }
 
     let record =
       records.find(item => item.id === CM.selectedRecord) ||
-      records.find(item =>
-        item.athleteId === CM.selectedAthlete
-      ) ||
+      records.find(item => item.athleteId === CM.selectedAthlete) ||
       records[0];
 
     CM.selectedRecord = record.id;
 
+    const samples = CM.recordSamples(record);
+    const reps = validReps(record);
     const controller = new AbortController();
     const signal = controller.signal;
 
     let active = true;
     let dirty = false;
     let saving = false;
+    let photoBusy = false;
+    let photoVideo = null;
+    let photoURL = null;
+    let unbindSeek = null;
+    let printCopies = [];
 
-    const initialMetric = record.exercise?.metric;
-    let joint = Object.hasOwn(joints, initialMetric)
-      ? initialMetric
-      : "knee";
+    const initialJoint = Object.hasOwn(jointNames, record.exercise?.metric)
+      ? record.exercise.metric : "knee";
 
-    let side = "left";
+    const firstTime = samples[0]?.t ?? 0;
+    const lastTime = samples[samples.length - 1]?.t ?? 0;
+
+    const state = {
+      part: initialJoint,
+      joint: initialJoint,
+      side: "both",
+      scoreSide: "left",
+      mode: "angle",
+      threshold: 0.55,
+      smooth: false,
+      start: firstTime,
+      end: lastTime,
+      time: firstTime,
+      lines: true,
+      bars: true,
+      paths: true,
+      photos: true
+    };
 
     const $ = selector => main.querySelector(selector);
 
+    function section(title, body, group = "") {
+      return `
+        <section class="panel report-section"
+          ${group ? `data-report-group="${group}"` : ""}
+          style="margin-bottom:18px">
+          <h2>${esc(title)}</h2>
+          ${body}
+        </section>
+      `;
+    }
+
+    function on(selector, type, callback) {
+      $(selector).addEventListener(type, event => {
+        try {
+          Promise.resolve(callback(event)).catch(error => {
+            console.error(error);
+            if (active) CM.toast(error.message || "작업에 실패했습니다.");
+          });
+        } catch (error) {
+          console.error(error);
+          CM.toast(error.message || "작업에 실패했습니다.");
+        }
+      }, { signal });
+    }
+
     main.innerHTML = `
-      ${CM.heading(
-        "자동 분석 리포트",
-        "SILVERSTAR · CODEON MOTION",
-        `
-          <button id="rp-save" class="primary">코치 메모 저장</button>
-          <button id="rp-csv">CSV</button>
-          <button id="rp-print">인쇄 / PDF</button>
-        `
-      )}
+      ${CM.heading("자동 분석 리포트", "SILVERSTAR · CODEON MOTION", `
+        <button id="rp-save" class="primary">코치 메모 저장</button>
+        <button id="rp-csv">CSV</button>
+        <button id="rp-print">인쇄 / PDF</button>
+      `)}
 
       <section class="panel no-print" style="margin-bottom:18px">
-        <div class="grid g3">
-          <label>
-            분석 기록
-            <select id="rp-record">
-              ${records.map(item => `
-                <option value="${esc(item.id)}"
-                  ${item.id === record.id ? "selected" : ""}>
-                  ${esc(CM.reportRecordLabel(item))}
-                </option>
-              `).join("")}
-            </select>
-          </label>
+        <label>분석 기록
+          <select id="rp-record">
+            ${records.map(item => `
+              <option value="${esc(item.id)}"
+                ${item.id === record.id ? "selected" : ""}>
+                ${esc(CM.reportRecordLabel(item))}
+              </option>
+            `).join("")}
+          </select>
+        </label>
 
-          <label>
-            분석 관절
-            <select id="rp-joint">
-              ${Object.entries(joints).map(([key, name]) => `
+        <div class="grid g3" style="margin-top:14px">
+          <label>자세히 볼 부위
+            <select id="rp-part">
+              ${Object.entries(partNames).map(([key, name]) => `
                 <option value="${key}"
-                  ${key === joint ? "selected" : ""}>
+                  ${key === state.part ? "selected" : ""}>
                   ${name}
                 </option>
               `).join("")}
             </select>
           </label>
 
-          <label>
-            육각형 기준 방향
+          <label>방향
             <select id="rp-side">
+              <option value="both">좌우 모두</option>
+              <option value="left">왼쪽만</option>
+              <option value="right">오른쪽만</option>
+            </select>
+          </label>
+
+          <label>상세 그래프 내용
+            <select id="rp-mode">
+              <option value="angle">각도 변화</option>
+              <option value="x">가로 위치 변화</option>
+              <option value="y">세로 위치 변화</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="grid g3" style="margin-top:14px">
+          <label>반복 비교 관절
+            <select id="rp-joint">
+              ${Object.entries(jointNames).map(([key, name]) => `
+                <option value="${key}"
+                  ${key === state.joint ? "selected" : ""}>
+                  ${name}
+                </option>
+              `).join("")}
+            </select>
+          </label>
+
+          <label>육각형 기준 방향
+            <select id="rp-score-side">
               <option value="left">왼쪽</option>
               <option value="right">오른쪽</option>
             </select>
           </label>
+
+          <label>그래프 표시
+            <select id="rp-smoothing">
+              <option value="raw">원본 측정값</option>
+              <option value="mean">보기용 5표본 평균선</option>
+            </select>
+          </label>
         </div>
+
+        <div class="grid g3" style="margin-top:14px">
+          <label>시작 초
+            <input id="rp-start" type="number"
+              step="0.01" value="${firstTime}">
+          </label>
+          <label>종료 초
+            <input id="rp-end" type="number"
+              step="0.01" value="${lastTime}">
+          </label>
+          <label>표시용 가시성 필터
+            <select id="rp-threshold">
+              <option value="0.55">기본 · 0.55 이상</option>
+              <option value="0.75">엄격 · 0.75 이상</option>
+              <option value="0.9">매우 엄격 · 0.90 이상</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="row" style="margin-top:14px;gap:12px;flex-wrap:wrap">
+          <button id="rp-full">전체 구간</button>
+          <label><input id="rp-lines" type="checkbox" checked> 꺾은선</label>
+          <label><input id="rp-bars" type="checkbox" checked> 막대</label>
+          <label><input id="rp-paths" type="checkbox" checked> 궤적</label>
+          <label><input id="rp-photos-toggle" type="checkbox" checked> 사진</label>
+        </div>
+
+        <p class="muted">
+          선택 구간은 상세·시간 그래프와 궤적에 적용됩니다.
+          육각형·반복 통계는 저장된 전체 기록 기준입니다.
+          가시성 필터는 정확도 비율이 아니며, 저장 당시 제외한 점을 복원하지 않습니다.
+        </p>
       </section>
 
-      <div id="rp-content"></div>
+      <div id="rp-summary"></div>
+      <div id="rp-radar"></div>
 
-      <section class="panel report-section"
-        id="rp-section-coach" style="margin-top:18px">
+      <section class="panel report-section" style="margin-bottom:18px">
+        <h2>선택 부위 · 스켈레톤과 그래프</h2>
+        <div id="rp-detail-chart" class="chart"></div>
+        <p id="rp-detail-note" class="muted"></p>
+
+        <input id="rp-time" type="range"
+          min="${firstTime}" max="${Math.max(firstTime + 0.01, lastTime)}"
+          value="${firstTime}" step="0.01"
+          aria-label="스켈레톤 확인 시점"
+          class="no-print" style="width:100%">
+
+        <div id="rp-skeleton"></div>
+      </section>
+
+      <div id="rp-graphs"></div>
+
+      <section id="rp-photo-section" class="panel report-section"
+        style="margin-bottom:18px">
+        <h2>동작 사진</h2>
+        <p id="rp-photo-status" class="muted">저장된 사진 확인 중…</p>
+        <div id="rp-photos" class="grid g3"></div>
+      </section>
+
+      <div id="rp-auto-feedback"></div>
+      <div id="rp-research"></div>
+
+      <section id="rp-section-coach" class="panel report-section">
         <h2>코치 추가 메모</h2>
-        <p class="muted">
-          자동 의견에 코치의 관찰과 다음 훈련 목표를 덧붙일 수 있습니다.
-        </p>
-
         <div class="grid g2">
-          <label>
-            잘한 점
+          <label>잘한 점
             <textarea id="rp-strengths" rows="4"></textarea>
           </label>
-          <label>
-            우선 확인할 점
+          <label>우선 확인할 점
             <textarea id="rp-priorities" rows="4"></textarea>
           </label>
-          <label>
-            코치 피드백
+          <label>코치 피드백
             <textarea id="rp-feedback" rows="5"></textarea>
           </label>
-          <label>
-            다음 목표
+          <label>다음 목표
             <textarea id="rp-goal" rows="5"></textarea>
           </label>
         </div>
 
-        <label style="display:block;margin-top:12px">
-          기록 메모
+        <label style="display:block;margin-top:12px">기록 메모
           <textarea id="rp-memo" rows="3"></textarea>
         </label>
 
         <div class="row no-print"
-          style="margin-top:14px;gap:8px;flex-wrap:wrap">
-          <button id="rp-training" class="primary">
-            추가 훈련 계획 만들기
-          </button>
+          style="gap:8px;flex-wrap:wrap;margin-top:14px">
+          <button id="rp-training" class="primary">추가 훈련 계획</button>
           <button id="rp-compare">기록 비교</button>
         </div>
       </section>
@@ -663,76 +690,491 @@
     };
 
     for (const [id, key] of Object.entries(fields)) {
-      const node = $(`#${id}`);
-      node.value = record[key] || "";
-      node.addEventListener("input", () => {
-        dirty = true;
-      }, { signal });
+      $(`#${id}`).value = record[key] || "";
+      on(`#${id}`, "input", () => { dirty = true; });
     }
 
-    let currentFeedback = null;
-    let currentMetrics = null;
+    let automaticNotes = [];
+    let automaticAxes = [];
 
-    function panel(title, content) {
-      return `
-        <section class="panel report-section"
-          style="margin-bottom:18px">
-          <h2>${esc(title)}</h2>
-          ${content}
-        </section>
+    function selectedSamples() {
+      return samples.filter(sample =>
+        sample.t >= state.start && sample.t <= state.end
+      );
+    }
+
+    function selectedSides(part = null) {
+      if (part === "pelvis") return ["left"];
+      return state.side === "both" ? ["left", "right"] : [state.side];
+    }
+
+    function series(name, getter, color) {
+      const data = selectedSamples().map(sample => ({
+        x: sample.t,
+        y: getter(sample)
+      }));
+
+      return {
+        name,
+        color,
+        data: state.smooth ? smooth(data) : data
+      };
+    }
+
+    function line(items, unit = "°") {
+      return `<div class="chart">${CM.lineChart(items, {
+        unit,
+        maxGap: 0.8,
+        xMin: state.start,
+        xMax: Math.max(state.start + 0.01, state.end)
+      })}</div>`;
+    }
+
+    function bars(items, unit) {
+      if (!items.some(item => finite(item.value))) {
+        return CM.empty("계산에 필요한 유효 자료가 부족합니다.");
+      }
+
+      return `<div class="chart">${CM.barChart(items, unit)}</div>`;
+    }
+
+    function showSummary() {
+      const validSamples = samples.filter(sample =>
+        (sample.points || []).some(p => validPoint(p))
+      ).length;
+
+      $("#rp-summary").innerHTML = section("기록 요약", `
+        <div class="grid g3">
+          <div><span class="muted">선수</span>
+            <h3>${esc(record.athleteName || "게스트")}</h3>
+          </div>
+          <div><span class="muted">운동</span>
+            <h3>${esc(record.exercise?.name || "운동")}</h3>
+          </div>
+          <div><span class="muted">촬영 방향</span>
+            <h3>${esc(CM.reportViewNames[record.view] || "미지정")}</h3>
+          </div>
+        </div>
+        <p>
+          저장 표본 ${samples.length}개 ·
+          기준점이 있는 표본 ${validSamples}개 ·
+          반복 구간 ${reps.length}개
+        </p>
+        <p class="muted">
+          모델: ${esc(record.poseConfig?.model || "기존 기록")} ·
+          분석값은 영상 기반 2D 추정입니다.
+        </p>
+      `);
+    }
+
+    function showRadarAndFeedback() {
+      const joint = state.joint;
+      const side = state.scoreSide;
+
+      const roms = reps.map(rep => repRange(
+        samples, rep, sample => angle(sample, joint, side)
+      )).filter(finite);
+
+      const durations = reps.map(rep => rep.end - rep.start);
+
+      const trunkRanges = reps.map(rep => repRange(
+        samples, rep, sample => metric(sample, `${side}_trunk`)
+      )).filter(finite);
+
+      const paired = samples.filter(sample =>
+        finite(angle(sample, joint, "left")) &&
+        finite(angle(sample, joint, "right"))
+      );
+
+      const difference = stats(paired.map(sample =>
+        Math.abs(angle(sample, joint, "left") - angle(sample, joint, "right"))
+      ));
+
+      const validCount = samples.filter(sample =>
+        finite(angle(sample, joint, side))
+      ).length;
+
+      const observationRate = samples.length
+        ? 100 * validCount / samples.length : null;
+
+      const target = Number(record.targetReps);
+      const bilateralView = ["front", "back"].includes(record.view);
+
+      const scores = [
+        consistency(roms),
+        consistency(durations),
+        bilateralView && paired.length >= 10
+          ? clamp(100 * (1 - difference.mean / 30), 0, 100) : null,
+        consistency(trunkRanges),
+        samples.length >= 10 ? observationRate : null,
+        record.exercise?.mode === "reps" && finite(target) && target > 0
+          ? clamp(100 * reps.length / target, 0, 100) : null
+      ];
+
+      automaticAxes = CM.reportAxes.map((name, index) => ({
+        name,
+        value: scores[index]
+      }));
+
+      $("#rp-radar").innerHTML = section("자동 육각형 · 참고 지표", `
+        <div class="grid g2">
+          <div class="chart">${CM.radar(automaticAxes)}</div>
+          <div>
+            <p>
+              ${side === "left" ? "왼쪽" : "오른쪽"}
+              ${jointNames[joint]} 기준 · 전체 기록
+            </p>
+            <table>
+              <thead><tr><th>항목</th><th>참고 점수</th></tr></thead>
+              <tbody>
+                ${automaticAxes.map(axis => `
+                  <tr>
+                    <td>${esc(axis.name)}</td>
+                    <td>${finite(axis.value)
+                      ? `${fmt(axis.value, 0)} / 100`
+                      : "자료 부족·적용 제외"}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <p class="muted">
+          논문으로 검증된 자세 점수가 아닙니다.
+          높은 일관성은 올바른 자세나 높은 근력을 뜻하지 않습니다.
+          편측·교대 운동에서는 좌우 유사도를 수행 평가로 사용하지 마세요.
+        </p>
+        <details>
+          <summary>계산 기준 보기</summary>
+          <ul>
+            <li>
+              일관성: 100 × (1 − 표준편차 / 평균).
+              유효 반복 3개 이상, 0~100 제한.
+            </li>
+            <li>
+              좌우 유사도: 100 × (1 − 평균 절대 각도 차이 / 30°).
+              30°는 앱 표시 기준이며 의학적 허용치가 아닙니다.
+            </li>
+            <li>
+              관측률: 선택 관절 유효 표본 / 저장 표본.
+              전체 영상 분석률이나 측정 정확도가 아닙니다.
+            </li>
+            <li>
+              목표 달성: 저장 반복 / 설정 목표.
+              자동 감지 구간은 실제 반복과 일치하는지 확인해야 합니다.
+            </li>
+          </ul>
+        </details>
+      `);
+
+      const observed = stats(samples.map(sample => angle(sample, joint, side)));
+      const timing = stats(durations);
+      const ranges = stats(roms);
+
+      automaticNotes = [
+        observed.count
+          ? `${side === "left" ? "왼쪽" : "오른쪽"} ${jointNames[joint]}에서 ` +
+            `${fmt(observed.min)}~${fmt(observed.max)}°가 관측되었습니다. ` +
+            "준비·휴식 구간도 포함될 수 있습니다."
+          : "선택 관절의 유효 측정값이 부족합니다.",
+        ranges.count
+          ? `유효 반복 ${ranges.count}개의 평균 각도 변화 폭은 ` +
+            `${fmt(ranges.mean)}°입니다. 반복 간 차이는 그래프에서 확인하세요.`
+          : "반복별 가동범위를 계산하기에 유효 자료가 부족합니다.",
+        timing.count
+          ? `반복 시간은 평균 ${fmt(timing.mean, 2)}초, ` +
+            `최소 ${fmt(timing.min, 2)}초, 최대 ${fmt(timing.max, 2)}초입니다.`
+          : "저장된 반복 구간이 없습니다.",
+        bilateralView && difference.count
+          ? `같은 시점의 좌우 각도 차이는 평균 ${fmt(difference.mean)}°입니다. ` +
+            "운동의 편측 여부와 카메라 구도를 먼저 확인하세요."
+          : "촬영 방향 또는 동시 측정값 부족으로 좌우 평가를 보류합니다."
+      ];
+
+      $("#rp-auto-feedback").innerHTML = section("자동 측정 피드백", `
+        <div class="grid g2">
+          ${automaticNotes.map((text, index) => `
+            <article class="panel">
+              <h3>${["관절 움직임", "반복별 범위", "수행 시간", "좌우 비교"][index]}</h3>
+              <p>${esc(text)}</p>
+            </article>
+          `).join("")}
+        </div>
+        <p class="muted">
+          측정 결과를 설명한 내용입니다.
+          근력 부족·부상·교정 필요 여부를 자동 진단하지 않습니다.
+          다음 촬영에서는 같은 구도와 운동 조건을 유지해 비교하세요.
+        </p>
+      `);
+    }
+
+    function nearestSample(time) {
+      let low = 0;
+      let high = samples.length - 1;
+
+      while (low < high) {
+        const middle = Math.floor((low + high) / 2);
+        if (samples[middle].t < time) low = middle + 1;
+        else high = middle;
+      }
+
+      const candidates = [samples[low], samples[low - 1]]
+        .filter(Boolean)
+        .sort((a, b) => Math.abs(a.t - time) - Math.abs(b.t - time));
+
+      return candidates[0] && Math.abs(candidates[0].t - time) <= 0.2
+        ? candidates[0] : null;
+    }
+
+    function showSkeleton() {
+      const sample = nearestSample(state.time);
+
+      if (!sample) {
+        $("#rp-skeleton").innerHTML =
+          CM.empty(`${fmt(state.time, 2)}초에 가까운 저장 표본이 없습니다.`);
+        return;
+      }
+
+      const width = finite(record.width) && record.width > 0 ? record.width : 1280;
+      const height = finite(record.height) && record.height > 0 ? record.height : 720;
+      const scale = Math.max(width, height) / 800;
+      const selected = new Set();
+
+      for (const side of selectedSides(state.part)) {
+        const ids = state.part === "pelvis"
+          ? [23, 24]
+          : state.part === "trunk"
+            ? side === "left" ? [11, 23] : [12, 24]
+            : triples[state.part] && state.mode === "angle"
+              ? triples[state.part][side]
+              : [pointIds[state.part][side]];
+
+        ids.forEach(id => selected.add(id));
+      }
+
+      const lines = edges.map(([a, b]) => {
+        const pa = point(sample, a, state.threshold);
+        const pb = point(sample, b, state.threshold);
+        if (!pa || !pb) return "";
+
+        const color = selected.has(a) && selected.has(b)
+          ? "#f5d76e" : leftIds.has(a) ? "#50daf2" : "#f58cce";
+
+        return `<line x1="${pa.x * width}" y1="${pa.y * height}"
+          x2="${pb.x * width}" y2="${pb.y * height}"
+          stroke="${color}" stroke-width="${3 * scale}"
+          stroke-linecap="round"/>`;
+      }).join("");
+
+      const nodes = [...new Set(edges.flat())].map(id => {
+        const p = point(sample, id, state.threshold);
+        if (!p) return "";
+
+        return `<circle cx="${p.x * width}" cy="${p.y * height}"
+          r="${(selected.has(id) ? 6 : 3) * scale}"
+          fill="${selected.has(id) ? "#f5d76e" :
+            leftIds.has(id) ? "#50daf2" : "#f58cce"}"/>`;
+      }).join("");
+
+      const values = selectedSides(state.part).map(side => {
+        const value = partValue(
+          sample, state.part, side, state.mode, state.threshold
+        );
+
+        return `${state.part === "pelvis" ? "골반" :
+          side === "left" ? "왼쪽" : "오른쪽"} ` +
+          `${fmt(value)}${state.mode === "angle" ? "°" : "%"}`;
+      }).join(" / ");
+
+      $("#rp-skeleton").innerHTML = `
+        <p>
+          선택 ${fmt(state.time, 2)}초 ·
+          저장 표본 ${fmt(sample.t, 2)}초 · ${esc(values)}
+        </p>
+        <svg xmlns="http://www.w3.org/2000/svg"
+          viewBox="0 0 ${width} ${height}"
+          role="img" aria-label="저장된 스켈레톤"
+          style="width:100%;max-height:350px;background:#06121b;
+                 border-radius:12px">
+          ${lines}${nodes}
+        </svg>
+        <p class="muted">
+          노란색은 선택 부위입니다. 원본 사진이 아니라 저장 기준점 재현입니다.
+        </p>
       `;
     }
 
-    function draw() {
-      const samples = CM.recordSamples(record);
-      const metrics = buildMetrics(record, samples, joint, side);
-      const feedback = buildFeedback(record, metrics, joint, side);
+    function showDetail() {
+      const selected = selectedSamples();
 
-      currentFeedback = feedback;
-      currentMetrics = metrics;
-
-      const angleSeries = [
-        {
-          name: `왼쪽 ${joints[joint]}`,
-          color: "#50daf2",
-          data: samples.map(sample => ({
-            x: sample.t,
-            y: valueOf(sample, joint, "left") ?? null
-          }))
-        },
-        {
-          name: `오른쪽 ${joints[joint]}`,
-          color: "#f58cce",
-          data: samples.map(sample => ({
-            x: sample.t,
-            y: valueOf(sample, joint, "right") ?? null
-          }))
-        }
-      ];
-
-      const signedDifference = samples.map(sample => {
-        const left = valueOf(sample, joint, "left");
-        const right = valueOf(sample, joint, "right");
+      const items = selectedSides(state.part).map(side => {
+        const data = selected.map(sample => ({
+          x: sample.t,
+          y: partValue(sample, state.part, side, state.mode, state.threshold)
+        }));
 
         return {
-          x: sample.t,
-          y: finite(left) && finite(right) ? left - right : null
+          name: state.part === "pelvis"
+            ? "골반"
+            : `${side === "left" ? "왼쪽" : "오른쪽"} ${partNames[state.part]}`,
+          color: side === "left" ? colors[0] : colors[1],
+          data: state.smooth ? smooth(data) : data
         };
       });
 
-      const snapshots = (record.snapshots || []).filter(snapshot =>
-        typeof snapshot.image === "string" &&
-        /^data:image\/(png|jpeg|webp);base64,/i.test(snapshot.image)
+      $("#rp-detail-chart").innerHTML = CM.lineChart(items, {
+        unit: state.mode === "angle" ? "°" : "%",
+        maxGap: 0.8,
+        xMin: state.start,
+        xMax: Math.max(state.start + 0.01, state.end),
+        currentTime: state.time
+      });
+
+      $("#rp-detail-note").textContent = state.mode === "angle"
+        ? state.part === "wrist"
+          ? "손목은 위치 그래프를 선택하세요. 손목 자체의 굽힘각은 제공하지 않습니다."
+          : "관절은 2D 내부각, 몸통은 수직선 기준, 골반은 영상상 골반선 기울기입니다."
+        : state.mode === "x"
+          ? "영상 왼쪽 0% → 오른쪽 100%. 실제 거리(cm)가 아닙니다."
+          : "영상 위쪽 0% → 아래쪽 100%. 실제 높이(cm)가 아닙니다.";
+
+      showSkeleton();
+    }
+
+    function trajectory(title, getter) {
+      const data = [];
+      let previousTime = null;
+
+      for (const sample of selectedSamples()) {
+        if (previousTime !== null && sample.t - previousTime > 0.8) {
+          data.push(null);
+        }
+
+        const p = getter(sample);
+        data.push(p ? { x: p.x * 100, y: p.y * 100 } : null);
+        previousTime = sample.t;
+      }
+
+      return section(title, `
+        <div class="chart">${CM.trajectoryChart(data)}</div>
+        <p class="muted">
+          영상상 위치 궤적입니다. 카메라 이동·촬영 배율의 영향을 받습니다.
+          실제 거리나 힘을 뜻하지 않습니다.
+        </p>
+      `, "paths");
+    }
+
+    function normalizedReps(side) {
+      return reps.slice(0, 12).map((rep, index) => {
+        const data = [];
+        let previousTime = null;
+
+        for (const sample of samples.filter(item =>
+          item.t >= rep.start && item.t <= rep.end
+        )) {
+          const x = 100 * (sample.t - rep.start) / (rep.end - rep.start);
+
+          if (previousTime !== null && sample.t - previousTime > 0.8) {
+            data.push({ x, y: null });
+          }
+
+          data.push({
+            x,
+            y: angle(sample, state.joint, side)
+          });
+
+          previousTime = sample.t;
+        }
+
+        return {
+          name: `${index + 1}회`,
+          color: colors[index % colors.length],
+          data
+        };
+      });
+    }
+
+    function showGraphs() {
+      let html = "";
+
+      for (const [joint, name] of Object.entries(jointNames)) {
+        html += section(`${name} · 좌우 각도 변화`, line(
+          selectedSides().map(side => series(
+            `${side === "left" ? "왼쪽" : "오른쪽"} ${name}`,
+            sample => partValue(sample, joint, side, "angle", state.threshold),
+            side === "left" ? colors[0] : colors[1]
+          ))
+        ), "lines");
+      }
+
+      html += section("몸통 기울기 변화", line(
+        selectedSides().map(side => series(
+          `${side === "left" ? "왼쪽" : "오른쪽"} 기준`,
+          sample => partValue(sample, "trunk", side, "angle", state.threshold),
+          side === "left" ? colors[0] : colors[1]
+        ))
+      ), "lines");
+
+      html += section("어깨선·골반선 기울기", line([
+        series("어깨선", sample => {
+          if (!point(sample, 11, state.threshold) ||
+              !point(sample, 12, state.threshold)) return null;
+          return metric(sample, "shoulderTilt");
+        }, colors[0]),
+        series("골반선", sample =>
+          partValue(sample, "pelvis", "left", "angle", state.threshold),
+          colors[1])
+      ]) + `
+        <p class="muted">영상상 선의 기울기이며 3D 회전각은 아닙니다.</p>
+      `, "lines");
+
+      html += section("골반 중심 · 가로 위치", line([
+        series("가로 위치", sample =>
+          partValue(sample, "pelvis", "left", "x", state.threshold), colors[3])
+      ], "%"), "lines");
+
+      html += section("골반 중심 · 세로 위치", line([
+        series("세로 위치", sample =>
+          partValue(sample, "pelvis", "left", "y", state.threshold), colors[2])
+      ], "%"), "lines");
+
+      const differenceSeries = series(
+        "왼쪽 − 오른쪽",
+        sample => {
+          const left = partValue(
+            sample, state.joint, "left", "angle", state.threshold
+          );
+          const right = partValue(
+            sample, state.joint, "right", "angle", state.threshold
+          );
+          return finite(left) && finite(right) ? left - right : null;
+        },
+        colors[2]
       );
 
-      const manualCount = samples.filter(sample => sample.manual).length;
+      html += section(
+        `${jointNames[state.joint]} · 좌우 차이`,
+        `<div class="chart">${CM.lineChart([differenceSeries], {
+          unit: "°",
+          min: -180,
+          max: 180,
+          maxGap: 0.8,
+          xMin: state.start,
+          xMax: Math.max(state.start + 0.01, state.end)
+        })}</div>
+        <p class="muted">
+          양수는 왼쪽 각도가 더 큽니다.
+          편측·교대 운동의 차이가 곧 이상을 의미하지는 않습니다.
+        </p>`,
+        "lines"
+      );
 
-      const statsRows = Object.entries(joints).map(([key, name]) => {
-        const left = stats(samples.map(sample =>
-          valueOf(sample, key, "left")
+      const rows = Object.entries(jointNames).map(([joint, name]) => {
+        const left = stats(selectedSamples().map(sample =>
+          partValue(sample, joint, "left", "angle", state.threshold)
         ));
-        const right = stats(samples.map(sample =>
-          valueOf(sample, key, "right")
+        const right = stats(selectedSamples().map(sample =>
+          partValue(sample, joint, "right", "angle", state.threshold)
         ));
 
         return `
@@ -746,265 +1188,378 @@
         `;
       }).join("");
 
-      $("#rp-content").innerHTML = `
-        ${panel("기록 요약", `
-          <div class="grid g3">
-            <div>
-              <span class="muted">선수</span>
-              <h3>${esc(record.athleteName || "게스트")}</h3>
-            </div>
-            <div>
-              <span class="muted">운동</span>
-              <h3>${esc(record.exercise?.name || "운동")}</h3>
-            </div>
-            <div>
-              <span class="muted">촬영 방향</span>
-              <h3>
-                ${esc(CM.reportViewNames[record.view] || "미지정")}
-              </h3>
-            </div>
-          </div>
+      html += section("관절별 관측 범위 · 선택 구간", `
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>관절</th><th>왼 최소/최대°</th><th>왼 변화 폭°</th>
+              <th>오른 최소/최대°</th><th>오른 변화 폭°</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <p class="muted">
+          관측된 각도의 범위이며 신체의 최대 가동범위 검사가 아닙니다.
+        </p>
+      `);
 
-          <p class="muted">
-            저장 표본 ${samples.length}개 ·
-            수동 수정 표본 ${manualCount}개 ·
-            반복 구간 ${metrics.reps.length}개
-          </p>
-          <p class="muted">
-            기준 관절: ${joints[joint]} /
-            ${side === "left" ? "왼쪽" : "오른쪽"}
-          </p>
-        `)}
+      for (const side of selectedSides()) {
+        const label = side === "left" ? "왼쪽" : "오른쪽";
 
-        ${panel("자동 육각형 분석", `
-          <div class="grid g2">
-            <div class="chart">${CM.radar(metrics.axes)}</div>
-            <div>
-              <table>
-                <thead>
-                  <tr><th>항목</th><th>참고 점수</th></tr>
-                </thead>
+        html += section(
+          `${label} ${jointNames[state.joint]} · 반복별 가동범위`,
+          bars(reps.map((rep, index) => ({
+            label: `${index + 1}회`,
+            name: `${index + 1}회`,
+            value: repRange(samples, rep, sample =>
+              angle(sample, state.joint, side)
+            ),
+            color: side === "left" ? colors[0] : colors[1]
+          })), "°"),
+          "bars"
+        );
+
+        html += section(
+          `${label} ${jointNames[state.joint]} · 반복 곡선 비교`,
+          reps.length
+            ? `<div class="chart">${CM.lineChart(normalizedReps(side), {
+                unit: "°",
+                xUnit: "%",
+                xMin: 0,
+                xMax: 100,
+                maxGap: 100
+              })}</div>
+              <p class="muted">
+                시작 0% → 종료 100%. 첫 12개 반복을 비교합니다.
+                원본 표본의 상대 시점만 변환하며 없는 값을 채우지 않습니다.
+              </p>`
+            : CM.empty("비교할 반복 구간이 없습니다."),
+          "lines"
+        );
+      }
+
+      for (const [title, getter, color] of [
+        ["반복별 전체 시간", rep => rep.end - rep.start, colors[1]],
+        ["반복별 하강 시간", rep =>
+          finite(rep.bottom) && rep.bottom >= rep.start && rep.bottom <= rep.end
+            ? rep.bottom - rep.start : null, colors[0]],
+        ["반복별 상승 시간", rep =>
+          finite(rep.bottom) && rep.bottom >= rep.start && rep.bottom <= rep.end
+            ? rep.end - rep.bottom : null, colors[3]]
+      ]) {
+        html += section(title, bars(reps.map((rep, index) => ({
+          label: `${index + 1}회`,
+          name: `${index + 1}회`,
+          value: getter(rep),
+          color
+        })), "s") + `
+          <p class="muted">
+            하강·상승은 저장된 최소 각도 시점 기준입니다.
+            실제 운동 단계와 맞는지 확인하세요.
+          </p>
+        `, "bars");
+      }
+
+      for (const side of selectedSides()) {
+        const label = side === "left" ? "왼쪽" : "오른쪽";
+
+        html += trajectory(`${label} 손목 궤적`, sample =>
+          point(sample, side === "left" ? 15 : 16, state.threshold)
+        );
+
+        html += trajectory(`${label} 발목 궤적`, sample =>
+          point(sample, side === "left" ? 27 : 28, state.threshold)
+        );
+      }
+
+      html += trajectory("골반 중심 궤적", sample =>
+        center(sample, [23, 24], state.threshold)
+      );
+
+      const hasBar = samples.some(sample =>
+        finite(sample.bar?.x) && finite(sample.bar?.y)
+      );
+
+      if (hasBar) {
+        html += trajectory("수동 지정 바벨 점 궤적", sample =>
+          finite(sample.bar?.x) && finite(sample.bar?.y) ? sample.bar : null
+        );
+      }
+
+      const compatible = records.filter(item =>
+        CM.reportCompatible(record, item)
+      ).slice(0, 7).concat(record).sort((a, b) =>
+        (Date.parse(a.createdAt || a.date) || 0) -
+        (Date.parse(b.createdAt || b.date) || 0)
+      );
+
+      if (compatible.length >= 2) {
+        html += section(
+          "이전 기록과 관측 범위 비교",
+          bars(compatible.map(item => {
+            const values = stats(CM.recordSamples(item).map(sample =>
+              angle(sample, state.joint, state.scoreSide)
+            ));
+
+            return {
+              label: new Date(item.createdAt || item.date).toLocaleDateString("ko-KR"),
+              name: item.exercise?.name || "운동",
+              value: values.range,
+              color: item.id === record.id ? colors[0] : colors[4]
+            };
+          }), "°") + `
+            <p class="muted">
+              같은 선수·운동·촬영 방향·측정 버전·모델 설정의 기록입니다.
+              촬영 구도와 중량까지 같다는 의미는 아닙니다.
+            </p>
+          `,
+          "bars"
+        );
+      }
+
+      $("#rp-graphs").innerHTML = html;
+      applyVisibility();
+    }
+
+    function showResearch() {
+      const papers = papersFor(record);
+
+      $("#rp-research").innerHTML = section("논문과 비교하기 · 참고 자료", `
+        <p class="muted">
+          논문은 비교 자료로만 제공합니다.
+          개인의 정상 각도 판정이나 육각형 계산에 사용하지 않습니다.
+        </p>
+        ${
+          papers.length
+            ? `<div class="table-wrap"><table>
+                <thead><tr>
+                  <th>연구</th><th>연구 조건</th>
+                  <th>주요 결과</th><th>비교할 때 확인</th>
+                </tr></thead>
                 <tbody>
-                  ${metrics.axes.map(axis => `
+                  ${papers.map(paper => `
                     <tr>
-                      <td>${esc(axis.name)}</td>
+                      <td><a href="${paper.url}" target="_blank"
+                        rel="noopener noreferrer">${esc(paper.name)}</a></td>
+                      <td>${esc(paper.subjects)}</td>
+                      <td>${esc(paper.result)}</td>
                       <td>
-                        ${
-                          finite(axis.value)
-                            ? `${fmt(axis.value, 0)} / 100`
-                            : "측정 부족·적용 제외"
-                        }
+                        ${esc(paper.compare)}
+                        <p class="muted">${esc(paper.limit)}</p>
                       </td>
                     </tr>
                   `).join("")}
                 </tbody>
-              </table>
+              </table></div>`
+            : CM.empty("이 종목에 직접 적용할 비교 논문은 아직 없습니다.")
+        }
+        <p class="muted">
+          연구 초록을 바탕으로 요약한 자료입니다.
+          성인 연구 결과를 청소년의 정상 각도 기준으로 그대로 적용하지 않습니다.
+        </p>
+      `);
+    }
 
-              <p class="muted">
-                점수가 높아도 올바른 자세나 높은 경기력을
-                보장하지 않습니다. 일관되게 잘못 수행한 동작도
-                일관성 점수는 높을 수 있습니다.
-              </p>
-            </div>
-          </div>
+    function applyVisibility() {
+      for (const group of ["lines", "bars", "paths"]) {
+        main.querySelectorAll(`[data-report-group="${group}"]`).forEach(node => {
+          node.hidden = !state[group];
+        });
+      }
+      $("#rp-photo-section").hidden = !state.photos;
+    }
 
-          <details>
-            <summary>점수 계산 기준 보기</summary>
-            <ul>
-              <li>
-                가동범위·템포·몸통 일관성:
-                100 × (1 − 표준편차 ÷ 평균).
-                0~100으로 제한하며 유효 반복 3개 이상이 필요합니다.
-              </li>
-              <li>
-                몸통 일관성은 반복마다 관측된 몸통 각도 변화 폭을
-                비교합니다. 몸통을 덜 움직였다는 점수가 아닙니다.
-              </li>
-              <li>
-                좌우 유사도:
-                100 × (1 − 평균 절대 각도 차이 ÷ 30°).
-                30°는 프로그램의 표시 기준이며 의학적 허용치가 아닙니다.
-                정면·후면에서 동시 유효 표본 10개 이상일 때만 계산합니다.
-              </li>
-              <li>
-                관측률: 선택 관절 유효 표본 ÷ 저장 표본 × 100.
-                전체 영상 분석률이나 정확도가 아닙니다.
-              </li>
-              <li>
-                목표 달성: 저장 반복 수 ÷ 설정 목표 × 100.
-                반복형 운동만 적용하며 최대 100입니다.
-              </li>
-              <li>
-                자동 반복 구간의 오류는 점수에도 영향을 줍니다.
-                교대·편측 운동은 좌우 유사도를 수행 평가로 사용하지 마세요.
-              </li>
-            </ul>
-          </details>
-        `)}
-
-        ${panel("관절 각도 변화", `
-          <div class="chart">
-            ${CM.lineChart(angleSeries, { unit: "°", maxGap: 0.8 })}
-          </div>
-          <p class="muted">
-            가로축은 시간, 세로축은 영상 기준 관절 각도입니다.
-            측정이 끊긴 구간은 연결하지 않습니다.
-          </p>
-        `)}
-
-        ${panel("관절별 관측 범위", `
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>관절</th>
-                  <th>왼쪽 최소 / 최대°</th>
-                  <th>왼쪽 변화 폭°</th>
-                  <th>오른쪽 최소 / 최대°</th>
-                  <th>오른쪽 변화 폭°</th>
-                </tr>
-              </thead>
-              <tbody>${statsRows}</tbody>
-            </table>
-          </div>
-          <p class="muted">
-            전체 기록에서 관측된 범위이며,
-            신체의 최대 가동범위를 측정한 검사는 아닙니다.
-          </p>
-        `)}
-
-        ${panel("좌우 각도 차이", `
-          <div class="chart">
-            ${CM.lineChart([{
-              name: "왼쪽 − 오른쪽",
-              color: "#f5d76e",
-              data: signedDifference
-            }], {
-              unit: "°",
-              min: -180,
-              max: 180,
-              maxGap: 0.8
-            })}
-          </div>
-          <p class="muted">
-            양수는 왼쪽 각도가 더 크고, 음수는 오른쪽 각도가 더 큽니다.
-            카메라에 보이는 2D 각도의 차이입니다.
-          </p>
-        `)}
-
-        ${panel("반복별 가동범위", `
-          <div class="chart">
-            ${CM.barChart(metrics.repetitionRows.map(row => ({
-              label: `${row.index}회`,
-              value: row.rom,
-              color: "#50daf2"
-            })), "°")}
-          </div>
-        `)}
-
-        ${panel("반복별 수행 시간", `
-          <div class="chart">
-            ${CM.barChart(metrics.repetitionRows.map(row => ({
-              label: `${row.index}회`,
-              value: row.duration,
-              color: "#f58cce"
-            })), "s")}
-          </div>
-        `)}
-
-        ${panel("몸통 기울기 변화", `
-          <div class="chart">
-            ${CM.lineChart([
-              {
-                name: "왼쪽 기준",
-                color: "#50daf2",
-                data: samples.map(sample => ({
-                  x: sample.t,
-                  y: trunkOf(sample, "left") ?? null
-                }))
-              },
-              {
-                name: "오른쪽 기준",
-                color: "#f58cce",
-                data: samples.map(sample => ({
-                  x: sample.t,
-                  y: trunkOf(sample, "right") ?? null
-                }))
-              }
-            ], { unit: "°", maxGap: 0.8 })}
-          </div>
-          <p class="muted">
-            수직선에 대한 몸통 기울기입니다.
-            운동과 촬영 방향에 따라 의미가 달라집니다.
-          </p>
-        `)}
-
-        ${panel("자동 코치 피드백", `
-          <p class="muted">
-            저장된 측정값으로 생성한 설명입니다.
-            낮은 점수를 곧바로 근력 부족이나 잘못된 자세로 해석하지 않습니다.
-          </p>
-          <div class="grid g2">
-            ${feedback.notes.map(note => `
-              <article class="panel">
-                <h3>${esc(note.title)}</h3>
-                <p>${esc(note.text)}</p>
-              </article>
-            `).join("")}
-          </div>
-        `)}
-
-        ${panel("다음 훈련을 위한 제안", `
-          <div class="grid g2">
-            ${feedback.drills.map(drill => `
-              <article class="panel">
-                <h3>${esc(drill.title)}</h3>
-                <p>${esc(drill.text)}</p>
-              </article>
-            `).join("")}
-          </div>
-          <p class="muted">
-            아래 ‘추가 훈련 계획 만들기’를 누르면
-            이 제안을 참고 내용으로 가져옵니다.
-            실제 종목·중량·횟수는 훈련 화면에서 선택하세요.
-          </p>
-        `)}
-
-        ${panel("저장된 동작 사진", snapshots.length
-          ? `
-            <div class="grid g3">
-              ${snapshots.map(snapshot => `
-                <figure style="margin:0">
-                  <img
-                    class="snapshot"
-                    style="width:100%;border-radius:10px"
-                    src="${esc(snapshot.image)}"
-                    alt="저장된 동작 사진"
-                    loading="lazy">
-                  <figcaption class="muted">
-                    ${fmt(snapshot.t, 2)}초
-                  </figcaption>
-                </figure>
-              `).join("")}
-            </div>
-          `
-          : CM.empty("분석 화면에서 저장한 동작 사진이 없습니다.")
-        )}
+    function photoCard(image, title, time) {
+      return `
+        <figure style="margin:0">
+          <img src="${esc(image)}" alt="${esc(title)}"
+            style="width:100%;border-radius:10px">
+          <figcaption>${esc(title)} · ${fmt(time, 2)}초</figcaption>
+        </figure>
       `;
+    }
+
+    function photoTargets() {
+      if (reps.length) {
+        return reps.slice(0, 4).flatMap((rep, index) => {
+          const bottom =
+            finite(rep.bottom) &&
+            rep.bottom >= rep.start &&
+            rep.bottom <= rep.end;
+
+          return [
+            { t: rep.start, title: `${index + 1}회 시작` },
+            {
+              t: bottom ? rep.bottom : (rep.start + rep.end) / 2,
+              title: `${index + 1}회 ${bottom ? "최소 각도" : "시간상 중간"}`
+            },
+            { t: rep.end, title: `${index + 1}회 종료` }
+          ];
+        });
+      }
+
+      if (!samples.length) return [];
+      const count = lastTime > firstTime ? 6 : 1;
+
+      return Array.from({ length: count }, (_, index) => ({
+        t: count === 1 ? firstTime :
+          firstTime + (lastTime - firstTime) * index / (count - 1),
+        title: `기록 구간 ${index + 1}`
+      }));
+    }
+
+    function videoEvent(video, eventName, action) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => finish(new Error("영상 프레임 준비 시간이 초과되었습니다.")),
+          12000
+        );
+
+        function finish(error) {
+          clearTimeout(timer);
+          video.removeEventListener(eventName, done);
+          video.removeEventListener("error", fail);
+          signal.removeEventListener("abort", abort);
+          if (error) reject(error);
+          else resolve();
+        }
+
+        function done() { finish(); }
+        function fail() { finish(new Error("원본 영상을 읽을 수 없습니다.")); }
+        function abort() { finish(new Error("리포트 화면이 닫혔습니다.")); }
+
+        video.addEventListener(eventName, done, { once: true });
+        video.addEventListener("error", fail, { once: true });
+        signal.addEventListener("abort", abort, { once: true });
+
+        try { action(); } catch (error) { finish(error); }
+      });
+    }
+
+    async function generatePhotos() {
+      const saved = (record.snapshots || []).filter(item =>
+        typeof item.image === "string" &&
+        /^data:image\/(jpeg|png|webp);base64,/i.test(item.image)
+      ).slice(0, 12);
+
+      $("#rp-photos").innerHTML = saved.map(item =>
+        photoCard(item.image, "저장된 동작 사진", item.t)
+      ).join("");
+
+      if (!record.mediaId) {
+        $("#rp-photo-status").textContent = saved.length
+          ? "저장된 캡처를 표시합니다. 원본 영상이 없어 추가 프레임은 추출하지 않습니다."
+          : "저장된 원본 영상과 캡처가 없습니다. 과거 카메라 사진은 복원할 수 없습니다.";
+        return;
+      }
+
+      photoBusy = true;
+      $("#rp-print").disabled = true;
+      $("#rp-photo-status").textContent = "원본 영상에서 동작 사진을 추출하는 중…";
+
+      try {
+        const media = await CM.db.get("media", record.mediaId);
+        if (!active) return;
+        if (!(media?.blob instanceof Blob)) throw new Error("저장된 원본 영상이 없습니다.");
+
+        photoURL = URL.createObjectURL(media.blob);
+        const video = document.createElement("video");
+        photoVideo = video;
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = "auto";
+        video.setAttribute("playsinline", "");
+
+        await videoEvent(video, "loadeddata", () => {
+          video.src = photoURL;
+          video.load();
+        });
+
+        if (
+          !finite(video.duration) ||
+          !video.videoWidth ||
+          !video.videoHeight
+        ) throw new Error("영상 정보를 확인하지 못했습니다.");
+
+        const output = document.createElement("canvas");
+        const ratio = Math.min(1, 720 / video.videoWidth);
+        output.width = Math.round(video.videoWidth * ratio);
+        output.height = Math.round(video.videoHeight * ratio);
+        const context = output.getContext("2d");
+
+        const targets = photoTargets();
+        let generatedHTML = "";
+
+        for (let index = 0; index < targets.length; index++) {
+          if (!active) return;
+
+          const target = targets[index];
+          const time = clamp(
+            target.t, 0, Math.max(0, video.duration - 0.001)
+          );
+
+          if (Math.abs(video.currentTime - time) > 0.001) {
+            await videoEvent(video, "seeked", () => {
+              video.currentTime = time;
+            });
+          }
+
+          if (!active) return;
+
+          context.drawImage(video, 0, 0, output.width, output.height);
+
+          generatedHTML += photoCard(
+            output.toDataURL("image/jpeg", 0.82),
+            target.title,
+            time
+          );
+
+          $("#rp-photos").innerHTML = generatedHTML;
+          $("#rp-photo-status").textContent =
+            `${index + 1}/${targets.length}장 추출 중…`;
+
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+
+        if (active) {
+          $("#rp-photo-status").textContent =
+            "원본 영상에서 자동 추출한 사진입니다. 인쇄/PDF에 포함됩니다. " +
+            "원본 기록의 캡처를 덮어쓰지 않습니다.";
+        }
+      } catch (error) {
+        if (active) {
+          console.warn(error);
+          $("#rp-photo-status").textContent =
+            "자동 추출을 완료하지 못했습니다. 현재 표시된 사진은 유지합니다.";
+        }
+      } finally {
+        photoVideo?.pause();
+
+        if (photoVideo) {
+          photoVideo.removeAttribute("src");
+          photoVideo.load();
+          photoVideo = null;
+        }
+
+        if (photoURL) {
+          URL.revokeObjectURL(photoURL);
+          photoURL = null;
+        }
+
+        photoBusy = false;
+        if (active) $("#rp-print").disabled = saving;
+      }
     }
 
     async function saveCoach() {
       if (saving) return false;
-
       saving = true;
       $("#rp-save").disabled = true;
+      $("#rp-print").disabled = true;
 
       try {
         const latest = await CM.db.get("records", record.id);
-
-        if (!latest) {
-          throw new Error("원본 분석 기록을 찾을 수 없습니다.");
-        }
+        if (!latest) throw new Error("저장된 분석 기록을 찾을 수 없습니다.");
 
         const updates = {};
 
@@ -1012,26 +1567,24 @@
           updates[key] = $(`#${id}`).value.trim();
         }
 
-        const updated = {
+        record = {
           ...latest,
           ...updates,
           updatedAt: new Date().toISOString(),
           autoReport: {
-            version: "descriptive-v1",
+            version: "integrated-report-v1",
             generatedAt: new Date().toISOString(),
-            joint,
-            side,
-            axes: currentMetrics.axes,
-            notes: currentFeedback.notes,
-            drills: currentFeedback.drills
+            joint: state.joint,
+            side: state.scoreSide,
+            axes: automaticAxes,
+            notes: automaticNotes,
+            researchRole: "reference-only"
           }
         };
 
-        await CM.db.put("records", updated);
-
-        record = updated;
+        await CM.db.put("records", record);
         dirty = false;
-        CM.toast("코치 메모와 자동 분석 요약을 저장했습니다.");
+        CM.toast("코치 메모와 분석 요약을 저장했습니다.");
         return true;
       } catch (error) {
         console.error(error);
@@ -1039,122 +1592,217 @@
         return false;
       } finally {
         saving = false;
-        if (active) $("#rp-save").disabled = false;
+        if (active) {
+          $("#rp-save").disabled = false;
+          $("#rp-print").disabled = photoBusy;
+        }
       }
     }
 
-    $("#rp-save").addEventListener("click", saveCoach, { signal });
+    function restorePrint() {
+      for (const item of printCopies) {
+        item.node.style.display = item.display;
+        item.copy.remove();
+      }
+      printCopies = [];
+    }
 
-    $("#rp-joint").addEventListener("change", event => {
-      joint = event.target.value;
-      draw();
-    }, { signal });
+    on("#rp-save", "click", saveCoach);
+    on("#rp-csv", "click", () => CM.exportRecordCSV(record));
 
-    $("#rp-side").addEventListener("change", event => {
-      side = event.target.value;
-      draw();
-    }, { signal });
-
-    $("#rp-record").addEventListener("change", async event => {
+    on("#rp-record", "change", async event => {
       if (saving) {
         event.target.value = record.id;
         CM.toast("저장이 끝난 뒤 선택해 주세요.");
         return;
       }
 
-      if (
-        dirty &&
-        !window.confirm("저장하지 않은 코치 메모를 버리고 이동할까요?")
-      ) {
+      if (dirty && !window.confirm("저장하지 않은 메모를 버리고 이동할까요?")) {
         event.target.value = record.id;
         return;
       }
 
       CM.selectedRecord = event.target.value;
       await CM.renderReports();
-    }, { signal });
+    });
 
-    $("#rp-csv").addEventListener("click", () => {
-      CM.exportRecordCSV(record);
-    }, { signal });
+    on("#rp-part", "change", event => {
+      state.part = event.target.value;
 
-    $("#rp-compare").addEventListener("click", () => {
-      location.hash = "compare";
-    }, { signal });
+      if (state.part === "wrist" && state.mode === "angle") {
+        state.mode = "x";
+        $("#rp-mode").value = "x";
+      }
 
-    $("#rp-training").addEventListener("click", async () => {
+      showDetail();
+    });
+
+    on("#rp-side", "change", event => {
+      state.side = event.target.value;
+      showDetail();
+      showGraphs();
+    });
+
+    on("#rp-mode", "change", event => {
+      state.mode = event.target.value;
+
+      if (state.part === "wrist" && state.mode === "angle") {
+        state.mode = "x";
+        event.target.value = "x";
+        CM.toast("손목은 위치 변화 그래프를 제공합니다.");
+      }
+
+      showDetail();
+    });
+
+    on("#rp-joint", "change", event => {
+      state.joint = event.target.value;
+      showRadarAndFeedback();
+      showGraphs();
+    });
+
+    on("#rp-score-side", "change", event => {
+      state.scoreSide = event.target.value;
+      showRadarAndFeedback();
+      showGraphs();
+    });
+
+    on("#rp-smoothing", "change", event => {
+      state.smooth = event.target.value === "mean";
+      showDetail();
+      showGraphs();
+    });
+
+    on("#rp-threshold", "change", event => {
+      state.threshold = Number(event.target.value);
+      showDetail();
+      showGraphs();
+    });
+
+    function setRange() {
+      const start = Number($("#rp-start").value);
+      const end = Number($("#rp-end").value);
+
+      if (
+        !finite(start) || !finite(end) ||
+        start < firstTime || end > lastTime || end <= start
+      ) {
+        $("#rp-start").value = state.start;
+        $("#rp-end").value = state.end;
+        CM.toast("저장된 기록 안에서 시작·종료 시간을 선택하세요.");
+        return;
+      }
+
+      state.start = start;
+      state.end = end;
+      state.time = clamp(state.time, start, end);
+
+      $("#rp-time").min = start;
+      $("#rp-time").max = end;
+      $("#rp-time").value = state.time;
+
+      showDetail();
+      showGraphs();
+    }
+
+    on("#rp-start", "change", setRange);
+    on("#rp-end", "change", setRange);
+
+    on("#rp-full", "click", () => {
+      state.start = firstTime;
+      state.end = lastTime;
+      state.time = firstTime;
+
+      $("#rp-start").value = firstTime;
+      $("#rp-end").value = lastTime;
+      $("#rp-time").min = firstTime;
+      $("#rp-time").max = Math.max(firstTime + 0.01, lastTime);
+      $("#rp-time").value = firstTime;
+
+      showDetail();
+      showGraphs();
+    });
+
+    on("#rp-time", "input", event => {
+      state.time = Number(event.target.value);
+      showSkeleton();
+    });
+
+    on("#rp-time", "change", showDetail);
+
+    for (const [id, key] of [
+      ["rp-lines", "lines"],
+      ["rp-bars", "bars"],
+      ["rp-paths", "paths"],
+      ["rp-photos-toggle", "photos"]
+    ]) {
+      on(`#${id}`, "change", event => {
+        state[key] = event.target.checked;
+        applyVisibility();
+      });
+    }
+
+    on("#rp-training", "click", async () => {
       if (saving) return;
       if (dirty && !(await saveCoach())) return;
 
-      const priorities = $("#rp-priorities").value.trim();
-      const goal = $("#rp-goal").value.trim();
-
       CM.selectedAthlete = record.athleteId || "";
-
       CM.trainingDraft = {
         athleteId: record.athleteId || "",
         athleteName: record.athleteName || "게스트",
         sourceRecordId: record.id,
-        reason: priorities || currentFeedback.notes.map(note =>
-          `${note.title}: ${note.text}`
-        ).join("\n\n"),
-        goal: goal || currentFeedback.drills.map(drill =>
-          `${drill.title}: ${drill.text}`
-        ).join("\n\n")
+        reason: $("#rp-priorities").value.trim() ||
+          automaticNotes.join("\n\n"),
+        goal: $("#rp-goal").value.trim() ||
+          "같은 촬영 구도와 운동 조건에서 다시 측정하고 반복별 움직임을 비교합니다."
       };
 
       location.hash = "training";
-    }, { signal });
+    });
 
-    let printCopies = [];
+    on("#rp-compare", "click", () => {
+      location.hash = "compare";
+    });
 
-    function restorePrint() {
-      for (const { node, copy, oldDisplay } of printCopies) {
-        node.style.display = oldDisplay;
-        copy.remove();
-      }
-      printCopies = [];
-    }
-
-    $("#rp-print").addEventListener("click", async () => {
-      if (saving) return;
+    on("#rp-print", "click", async () => {
+      if (saving || photoBusy) return;
       if (dirty && !(await saveCoach())) return;
 
       restorePrint();
 
       for (const id of Object.keys(fields)) {
         const node = $(`#${id}`);
-        const copy = document.createElement("div");
+        const element = document.createElement("div");
+        element.textContent = node.value || "입력 없음";
+        element.style.whiteSpace = "pre-wrap";
+        element.style.overflowWrap = "anywhere";
+        element.style.padding = "10px 0";
 
-        copy.textContent = node.value || "입력 없음";
-        copy.style.whiteSpace = "pre-wrap";
-        copy.style.overflowWrap = "anywhere";
-        copy.style.padding = "10px 0";
+        printCopies.push({
+          node,
+          copy: element,
+          display: node.style.display
+        });
 
-        const oldDisplay = node.style.display;
         node.style.display = "none";
-        node.after(copy);
-
-        printCopies.push({ node, copy, oldDisplay });
+        node.after(element);
       }
 
       try {
         window.print();
       } catch (error) {
         restorePrint();
-        CM.toast("인쇄 창을 열지 못했습니다.");
+        throw error;
       }
-    }, { signal });
+    });
 
     window.addEventListener("afterprint", restorePrint, { signal });
 
-    function beforeUnload(event) {
+    window.addEventListener("beforeunload", event => {
       if (!dirty && !saving) return;
       event.preventDefault();
       event.returnValue = "";
-    }
-
-    window.addEventListener("beforeunload", beforeUnload, { signal });
+    }, { signal });
 
     CM.reportsCanLeave = () => {
       if (saving) {
@@ -1170,992 +1818,41 @@
       active = false;
       restorePrint();
       controller.abort();
+
+      if (unbindSeek) unbindSeek();
+      unbindSeek = null;
+
+      photoVideo?.pause();
+
+      if (photoURL) {
+        URL.revokeObjectURL(photoURL);
+        photoURL = null;
+      }
+
       CM.reportsCanLeave = null;
       CM.reportsCleanup = null;
     };
 
-    draw();
+    unbindSeek = CM.bindChartSeek($("#rp-detail-chart"), time => {
+      state.time = clamp(time, state.start, state.end);
+      $("#rp-time").value = state.time;
+      showDetail();
+    });
+
+    showSummary();
+    showRadarAndFeedback();
+    showDetail();
+    showGraphs();
+    showResearch();
+    void generatePhotos();
   };
 
   CM.renderFeedback = async () => {
     await CM.renderReports();
 
-    document.querySelector("#rp-section-coach")?.scrollIntoView({
+    document.querySelector("#rp-auto-feedback")?.scrollIntoView({
       behavior: "smooth",
       block: "start"
     });
-  };
-})();
-/*
-  CODEON MOTION
-  리포트 확장: 관절 탐색 + 연구 근거 피드백
-
-  기존 reports.js 마지막 줄 아래에 추가하세요.
-  기존 reports.js를 지우지 않습니다.
-
-  연구 내용:
-  - 확인한 논문 초록을 바탕으로 요약
-  - 연구에서 검증하지 않은 정상 각도는 생성하지 않음
-  - 운동 수행의 개인별 정상/비정상 진단에 사용하지 않음
-*/
-
-(() => {
-  "use strict";
-
-  const CM = window.CM;
-
-  if (!CM || typeof CM.renderReports !== "function") {
-    console.error("기존 reports.js를 먼저 불러와야 합니다.");
-    return;
-  }
-
-  if (CM.researchReportInstalled) return;
-  CM.researchReportInstalled = true;
-
-  const baseRenderReports = CM.renderReports;
-  const finite = Number.isFinite;
-  const escape = value => CM.escape(String(value ?? ""));
-
-  const parts = {
-    shoulder: {
-      name: "어깨",
-      points: { left: 11, right: 12 },
-      angle: true
-    },
-    elbow: {
-      name: "팔꿈치",
-      points: { left: 13, right: 14 },
-      angle: true
-    },
-    wrist: {
-      name: "손목",
-      points: { left: 15, right: 16 },
-      angle: false
-    },
-    hip: {
-      name: "고관절",
-      points: { left: 23, right: 24 },
-      angle: true
-    },
-    knee: {
-      name: "무릎",
-      points: { left: 25, right: 26 },
-      angle: true
-    },
-    ankle: {
-      name: "발목",
-      points: { left: 27, right: 28 },
-      angle: true
-    },
-    trunk: {
-      name: "몸통",
-      points: null,
-      angle: true
-    },
-    pelvis: {
-      name: "골반",
-      points: null,
-      angle: true
-    }
-  };
-
-  const jointTriples = {
-    shoulder: {
-      left: [23, 11, 13],
-      right: [24, 12, 14]
-    },
-    elbow: {
-      left: [11, 13, 15],
-      right: [12, 14, 16]
-    },
-    hip: {
-      left: [11, 23, 25],
-      right: [12, 24, 26]
-    },
-    knee: {
-      left: [23, 25, 27],
-      right: [24, 26, 28]
-    },
-    ankle: {
-      left: [25, 27, 31],
-      right: [26, 28, 32]
-    }
-  };
-
-  const skeletonEdges = [
-    [11, 12],
-    [11, 13], [13, 15],
-    [12, 14], [14, 16],
-    [11, 23], [12, 24], [23, 24],
-    [23, 25], [25, 27],
-    [24, 26], [26, 28],
-    [27, 29], [29, 31], [27, 31],
-    [28, 30], [30, 32], [28, 32]
-  ];
-
-  const leftIds = new Set([
-    11, 13, 15, 23, 25, 27, 29, 31
-  ]);
-
-  const studies = {
-    squatKnee: {
-      title:
-        "Effect of knee position on hip and knee torques " +
-        "during the barbell squat",
-      author: "Fry ほか".replace("ほか", "외"),
-      year: 2003,
-      population: "웨이트 훈련 경험이 있는 성인 남성 7명",
-      url: "https://pubmed.ncbi.nlm.nih.gov/14636100/",
-      finding:
-        "평행 바벨 스쿼트에서 무릎의 전진을 제한했을 때 " +
-        "무릎 토크는 감소하고 고관절 토크는 증가했습니다.",
-      limit:
-        "특정 조건의 소규모 성인 연구입니다. " +
-        "무릎이 발끝을 넘는다는 이유만으로 실패 판정을 내리는 " +
-        "근거로 사용하지 않습니다."
-    },
-    squatTrunk: {
-      title:
-        "Targeting the hip and/or knee extensors during the back squat " +
-        "in males and females: A repeated measures decision tree analysis",
-      author: "백 스쿼트 반복측정 연구",
-      year: 2025,
-      population: "건강한 참가자 16명",
-      url: "https://pubmed.ncbi.nlm.nih.gov/40157154/",
-      finding:
-        "몸통과 정강이 기울기의 상대적 차이, 무릎 굽힘 정도가 " +
-        "고관절·무릎 폄 모멘트의 비율과 관련되었습니다.",
-      limit:
-        "몸통 각도 하나의 정상 범위를 제시한 연구가 아닙니다. " +
-        "이 앱은 관절 모멘트나 실제 부하를 직접 측정하지 않습니다."
-    },
-    pushHand: {
-      title: "Hand position affects elbow joint load during push-up exercise",
-      author: "Donkers 외",
-      year: 1993,
-      population: "건강한 성인 남성 9명",
-      url: "https://pubmed.ncbi.nlm.nih.gov/8514808/",
-      finding:
-        "여섯 가지 손 위치에서 푸시업을 비교했을 때 " +
-        "팔꿈치에 작용하는 힘과 토크가 달라졌습니다.",
-      limit:
-        "특정 팔꿈치 각도 하나를 모두에게 안전한 정답으로 " +
-        "지정한 연구가 아닙니다."
-    },
-    pushLoad: {
-      title: "Kinetic analysis of several variations of push-ups",
-      author: "Ebben 외",
-      year: 2011,
-      population: "운동을 하는 성인 23명",
-      url: "https://pubmed.ncbi.nlm.nih.gov/21873902/",
-      finding:
-        "손을 높인 푸시업과 무릎을 댄 푸시업에서는 " +
-        "일반 푸시업보다 낮은 최대 수직 지면반력이 관측되었습니다.",
-      limit:
-        "외부 부하를 비교한 결과입니다. " +
-        "개인의 통증 개선이나 부상 예방 효과를 증명한 것은 아닙니다."
-    }
-  };
-
-  function format(value, digits = 1) {
-    return finite(value) ? value.toFixed(digits) : "—";
-  }
-
-  function summary(values) {
-    let min = Infinity;
-    let max = -Infinity;
-    let sum = 0;
-    let count = 0;
-
-    for (const value of values) {
-      if (!finite(value)) continue;
-      min = Math.min(min, value);
-      max = Math.max(max, value);
-      sum += value;
-      count++;
-    }
-
-    return count
-      ? { min, max, mean: sum / count, count, range: max - min }
-      : { min: null, max: null, mean: null, count: 0, range: null };
-  }
-
-  function pointValid(point, threshold) {
-    return Boolean(
-      point &&
-      finite(point.x) &&
-      finite(point.y) &&
-      (
-        point.manual ||
-        (finite(point.visibility) && point.visibility >= threshold)
-      )
-    );
-  }
-
-  function pointsValid(sample, ids, threshold) {
-    return ids.every(id => pointValid(sample.points?.[id], threshold));
-  }
-
-  function averagePoint(sample, ids, threshold) {
-    if (!pointsValid(sample, ids, threshold)) return null;
-
-    return {
-      x: ids.reduce((sum, id) => sum + sample.points[id].x, 0) / ids.length,
-      y: ids.reduce((sum, id) => sum + sample.points[id].y, 0) / ids.length
-    };
-  }
-
-  /*
-    위치 그래프는 영상 너비·높이에 대한 백분율입니다.
-    실제 cm 단위 이동 거리가 아닙니다.
-  */
-  function sampleValue(sample, part, side, mode, threshold) {
-    const definition = parts[part];
-
-    if (mode !== "angle") {
-      let point = null;
-
-      if (part === "trunk") {
-        const ids = side === "left" ? [11, 23] : [12, 24];
-        point = averagePoint(sample, ids, threshold);
-      } else if (part === "pelvis") {
-        point = averagePoint(sample, [23, 24], threshold);
-      } else {
-        const candidate = sample.points?.[definition.points[side]];
-        if (pointValid(candidate, threshold)) point = candidate;
-      }
-
-      if (!point) return null;
-      return (mode === "x" ? point.x : point.y) * 100;
-    }
-
-    if (part === "wrist") return null;
-
-    if (part === "trunk") {
-      const ids = side === "left" ? [11, 23] : [12, 24];
-      if (!pointsValid(sample, ids, threshold)) return null;
-
-      const value = sample.metrics?.[`${side}_trunk`];
-      return finite(value) ? value : null;
-    }
-
-    if (part === "pelvis") {
-      if (!pointsValid(sample, [23, 24], threshold)) return null;
-
-      const value = sample.metrics?.hipTilt;
-      return finite(value) ? value : null;
-    }
-
-    if (!pointsValid(sample, jointTriples[part][side], threshold)) {
-      return null;
-    }
-
-    const value = sample.angles?.[`${side}_${part}`];
-    return finite(value) ? value : null;
-  }
-
-  /*
-    표시용 이동평균:
-    - 원본 기록은 수정하지 않습니다.
-    - null과 0.8초를 넘는 공백은 연결하지 않습니다.
-    - 구간 안의 연속된 최대 5개 표본을 평균 냅니다.
-  */
-  function smoothLine(data) {
-    const result = data.map(point => ({ ...point }));
-    let start = 0;
-
-    while (start < data.length) {
-      if (!finite(data[start].y)) {
-        start++;
-        continue;
-      }
-
-      let end = start;
-
-      while (
-        end + 1 < data.length &&
-        finite(data[end + 1].y) &&
-        data[end + 1].x - data[end].x <= 0.8
-      ) {
-        end++;
-      }
-
-      for (let index = start; index <= end; index++) {
-        const from = Math.max(start, index - 2);
-        const to = Math.min(end, index + 2);
-
-        let sum = 0;
-        for (let cursor = from; cursor <= to; cursor++) {
-          sum += data[cursor].y;
-        }
-
-        result[index].y = sum / (to - from + 1);
-      }
-
-      start = end + 1;
-    }
-
-    return result;
-  }
-
-  function exerciseFamily(record) {
-    const name = record.exercise?.name || "";
-
-    if (
-      record.exercise?.icon === "squat" ||
-      /스쿼트|스쾃|squat/i.test(name)
-    ) return "squat";
-
-    if (
-      record.exercise?.icon === "pushup" ||
-      /푸시업|푸쉬업|팔굽혀|push.?up/i.test(name)
-    ) return "pushup";
-
-    return "other";
-  }
-
-  function researchFor(record) {
-    const family = exerciseFamily(record);
-
-    if (family === "squat") {
-      return {
-        papers: [studies.squatKnee, studies.squatTrunk],
-        interpretation:
-          "스쿼트는 무릎의 전진, 몸통과 정강이 기울기, 깊이를 " +
-          "함께 확인해야 합니다. 현재 선택한 각도만으로 " +
-          "정상·비정상 또는 관절 부하를 판정하지 않습니다.",
-        practice:
-          "코칭 적용 제안: 같은 중량·발 간격·촬영 구도에서 " +
-          "코치가 정한 동작 범위를 수행하고 다시 촬영하세요. " +
-          "무릎을 발끝 뒤에 두기 위해 억지로 제한하지 말고, " +
-          "몸통과 정강이 움직임을 함께 확인하세요.",
-        practiceLimit:
-          "이 비교 촬영 절차 자체가 논문에서 효과 검증된 " +
-          "개인별 교정 프로그램이라는 뜻은 아닙니다."
-      };
-    }
-
-    if (family === "pushup") {
-      return {
-        papers: [studies.pushHand, studies.pushLoad],
-        interpretation:
-          "푸시업은 손 위치와 지지 높이에 따라 부하가 달라집니다. " +
-          "팔꿈치 각도 하나만으로 잘못된 자세라고 단정하지 않습니다.",
-        practice:
-          "코칭 적용 제안: 일반 푸시업 수행이 어렵다면 " +
-          "안정적인 높은 지지대에 손을 올리는 변형을 코치와 검토하세요. " +
-          "같은 손 위치에서 촬영해 반복별 팔꿈치 움직임을 비교하세요.",
-        practiceLimit:
-          "손을 높인 변형의 낮은 외부 부하는 연구에 근거하지만, " +
-          "현재 영상으로 특정 근육 약화나 필요한 지지 높이를 " +
-          "자동 결정할 수는 없습니다."
-      };
-    }
-
-    return {
-      papers: [],
-      interpretation:
-        "이 운동에 직접 적용할 논문 규칙은 아직 등록하지 않았습니다. " +
-        "관측값은 제공하지만 다른 운동의 각도 기준을 가져와 " +
-        "좋다·나쁘다를 판정하지 않습니다.",
-      practice:
-        "코칭 적용 제안: 같은 촬영 구도와 운동 조건에서 " +
-        "코치가 정한 목표 동작과 비교하세요.",
-      practiceLimit:
-        "이 종목의 연구 근거를 추가하기 전에는 " +
-        "논문 기반 교정이라고 표시하지 않습니다."
-    };
-  }
-
-  CM.renderReports = async function (...args) {
-    await baseRenderReports.apply(CM, args);
-
-    const main = document.querySelector("#main");
-    if (!main?.querySelector("#rp-content")) return;
-
-    const record = await CM.db.get("records", CM.selectedRecord);
-    if (!record) return;
-
-    const samples = CM.recordSamples(record);
-    if (!samples.length) return;
-
-    const controller = new AbortController();
-    const signal = controller.signal;
-    const previousCleanup = CM.reportsCleanup;
-
-    let unbindSeek = null;
-
-    const state = {
-      part: "knee",
-      side: "both",
-      mode: "angle",
-      smooth: false,
-      threshold: 0.75,
-      start: samples[0].t,
-      end: samples[samples.length - 1].t,
-      time: samples[0].t
-    };
-
-    const metric = record.exercise?.metric;
-    if (Object.hasOwn(parts, metric)) state.part = metric;
-
-    const research = researchFor(record);
-
-    let currentObservation = "";
-
-    function selectedSides() {
-      if (state.part === "pelvis") return ["left"];
-      return state.side === "both" ? ["left", "right"] : [state.side];
-    }
-
-    function rawSeries() {
-      const selected = samples.filter(sample =>
-        sample.t >= state.start && sample.t <= state.end
-      );
-
-      return selectedSides().map(side => ({
-        name: state.part === "pelvis"
-          ? "골반 중심 / 골반선"
-          : `${side === "left" ? "왼쪽" : "오른쪽"} ${parts[state.part].name}`,
-        color: side === "left" ? "#50daf2" : "#f58cce",
-        data: selected.map(sample => ({
-          x: sample.t,
-          y: sampleValue(
-            sample,
-            state.part,
-            side,
-            state.mode,
-            state.threshold
-          )
-        }))
-      }));
-    }
-
-    function findSample(time) {
-      let low = 0;
-      let high = samples.length - 1;
-
-      while (low < high) {
-        const middle = Math.floor((low + high) / 2);
-        if (samples[middle].t < time) low = middle + 1;
-        else high = middle;
-      }
-
-      const candidates = [samples[low], samples[low - 1]].filter(Boolean);
-
-      candidates.sort((a, b) =>
-        Math.abs(a.t - time) - Math.abs(b.t - time)
-      );
-
-      const nearest = candidates[0];
-
-      return nearest && Math.abs(nearest.t - time) <= 0.2
-        ? nearest
-        : null;
-    }
-
-    function selectedPointIds() {
-      const ids = new Set();
-
-      for (const side of selectedSides()) {
-        if (state.part === "trunk") {
-          (side === "left" ? [11, 23] : [12, 24])
-            .forEach(id => ids.add(id));
-        } else if (state.part === "pelvis") {
-          ids.add(23);
-          ids.add(24);
-        } else if (state.mode === "angle" && jointTriples[state.part]) {
-          jointTriples[state.part][side].forEach(id => ids.add(id));
-        } else {
-          ids.add(parts[state.part].points[side]);
-        }
-      }
-
-      return ids;
-    }
-
-    function renderSkeleton() {
-      const host = main.querySelector("#rx-skeleton");
-      const label = main.querySelector("#rx-frame-label");
-      if (!host || !label) return;
-
-      const sample = findSample(state.time);
-
-      label.textContent = `선택 시점 ${format(state.time, 2)}초`;
-
-      if (!sample) {
-        host.innerHTML = CM.empty(
-          "이 시점에 가까운 저장 표본이 없습니다."
-        );
-        return;
-      }
-
-      const w = finite(record.width) && record.width > 0
-        ? record.width : 1280;
-      const h = finite(record.height) && record.height > 0
-        ? record.height : 720;
-
-      const scale = Math.max(w, h) / 800;
-      const points = sample.points || [];
-      const highlight = selectedPointIds();
-
-      const lines = skeletonEdges.map(([a, b]) => {
-        const pa = points[a];
-        const pb = points[b];
-
-        if (
-          !pointValid(pa, state.threshold) ||
-          !pointValid(pb, state.threshold)
-        ) return "";
-
-        const color = highlight.has(a) && highlight.has(b)
-          ? "#f5d76e"
-          : leftIds.has(a) ? "#50daf2" : "#f58cce";
-
-        return `
-          <line
-            x1="${pa.x * w}" y1="${pa.y * h}"
-            x2="${pb.x * w}" y2="${pb.y * h}"
-            stroke="${color}"
-            stroke-width="${3 * scale}"
-            stroke-linecap="round"/>
-        `;
-      }).join("");
-
-      const nodes = [...new Set(skeletonEdges.flat())].map(id => {
-        const point = points[id];
-        if (!pointValid(point, state.threshold)) return "";
-
-        const selected = highlight.has(id);
-        const color = selected
-          ? "#f5d76e"
-          : leftIds.has(id) ? "#50daf2" : "#f58cce";
-
-        return `
-          <circle cx="${point.x * w}" cy="${point.y * h}"
-            r="${(selected ? 6 : 3) * scale}" fill="${color}"/>
-        `;
-      }).join("");
-
-      const values = selectedSides().map(side => {
-        const value = sampleValue(
-          sample, state.part, side, state.mode, state.threshold
-        );
-
-        const name = state.part === "pelvis"
-          ? "골반"
-          : side === "left" ? "왼쪽" : "오른쪽";
-
-        return `${name}: ${format(value)}${state.mode === "angle" ? "°" : "%"}`;
-      }).join(" / ");
-
-      host.innerHTML = `
-        <svg xmlns="http://www.w3.org/2000/svg"
-          viewBox="0 0 ${w} ${h}"
-          role="img" aria-label="저장된 기준점으로 표시한 스켈레톤"
-          style="width:100%;max-height:350px;background:#06121b;
-                 border-radius:12px">
-          ${lines}${nodes}
-        </svg>
-        <p>${escape(values)}</p>
-        <p class="muted">
-          저장 표본 ${format(sample.t, 2)}초 ·
-          선택 부위는 노란색 · 원본 영상이 아닌 기준점 재현입니다.
-        </p>
-      `;
-    }
-
-    function renderFeedback(series) {
-      const unit = state.mode === "angle" ? "°" : "%";
-      const modeLabel = {
-        angle: "각도",
-        x: "가로 위치",
-        y: "세로 위치"
-      }[state.mode];
-
-      const observations = series.map(item => {
-        const values = summary(item.data.map(point => point.y));
-
-        if (!values.count) {
-          return `${item.name}: 선택한 인식 기준을 만족하는 자료가 없습니다.`;
-        }
-
-        return (
-          `${item.name} ${modeLabel}: ${format(values.min)}~` +
-          `${format(values.max)}${unit}, 평균 ` +
-          `${format(values.mean)}${unit}, 유효 표본 ${values.count}개.`
-        );
-      });
-
-      currentObservation = observations.join("\n");
-
-      const host = main.querySelector("#rx-feedback");
-      if (!host) return;
-
-      host.innerHTML = `
-        <h2>측정 결과와 연구 근거 피드백</h2>
-
-        <article class="panel" style="margin-bottom:12px">
-          <h3>1. 현재 기록에서 관측한 내용</h3>
-          ${observations.map(text => `<p>${escape(text)}</p>`).join("")}
-          <p class="muted">
-            선택 구간의 원본 유효값으로 계산합니다.
-            보기용 평균선으로 점수나 통계를 바꾸지 않습니다.
-          </p>
-        </article>
-
-        <article class="panel" style="margin-bottom:12px">
-          <h3>2. 어떻게 해석할까?</h3>
-          <p>${escape(research.interpretation)}</p>
-          <p class="muted">
-            현재 판정: 측정값 제공 / 개인별 정상 각도 판정은 보류.
-            2D 내부각과 논문의 해부학적 굽힘각은 정의가 다를 수 있습니다.
-          </p>
-        </article>
-
-        <article class="panel" style="margin-bottom:12px">
-          <h3>3. 확인과 개선 연습</h3>
-          <p>${escape(research.practice)}</p>
-          <p class="muted">${escape(research.practiceLimit)}</p>
-          <p class="muted">
-            인식이 불안정한 구간은 먼저 원본 영상과 기준점부터 확인하세요.
-            통증이 생기는 동작을 각도 목표에 맞추려고 반복하지 마세요.
-          </p>
-          <button id="rx-training" class="primary no-print">
-            이 내용을 추가 훈련 계획으로
-          </button>
-        </article>
-
-        <h3>4. 적용한 논문</h3>
-        ${
-          research.papers.length
-            ? research.papers.map(paper => `
-              <article class="panel" style="margin-bottom:10px">
-                <strong>${escape(paper.author)} · ${paper.year}</strong>
-                <p>
-                  <a href="${paper.url}" target="_blank"
-                    rel="noopener noreferrer">
-                    ${escape(paper.title)}
-                  </a>
-                </p>
-                <p class="muted">${escape(paper.population)}</p>
-                <p>${escape(paper.finding)}</p>
-                <p class="muted">${escape(paper.limit)}</p>
-              </article>
-            `).join("")
-            : CM.empty("이 운동에 직접 적용할 연구 규칙은 아직 없습니다.")
-        }
-
-        <p class="muted">
-          위 논문은 연구 초록을 확인해 요약했습니다.
-          성인 연구를 청소년의 정상 각도나 부상 위험 기준으로
-          그대로 적용하지 않습니다.
-          기존 육각형은 앱의 참고 지표이며 논문으로 검증된 평가표가 아닙니다.
-        </p>
-      `;
-    }
-
-    function update() {
-      const chart = main.querySelector("#rx-chart");
-      if (!chart) return;
-
-      const series = rawSeries();
-
-      const displayed = series.map(item => ({
-        ...item,
-        name: item.name + (state.smooth ? " · 보기용 평균" : " · 원본"),
-        data: state.smooth ? smoothLine(item.data) : item.data
-      }));
-
-      chart.innerHTML = CM.lineChart(displayed, {
-        unit: state.mode === "angle" ? "°" : "%",
-        maxGap: 0.8,
-        xMin: state.start,
-        xMax: state.end > state.start ? state.end : state.start + 0.1,
-        currentTime: state.time
-      });
-
-      const note = main.querySelector("#rx-note");
-      note.textContent = state.mode === "angle"
-        ? (
-            state.part === "pelvis"
-              ? "골반선의 영상상 기울기입니다. 골반의 전후경사나 3D 회전각이 아닙니다."
-              : state.part === "trunk"
-                ? "수직선에 대한 몸통 기울기입니다."
-                : "선택 관절의 영상상 2D 내부각입니다."
-          )
-        : (
-            state.mode === "x"
-              ? "영상 왼쪽이 0%, 오른쪽이 100%입니다. 몸의 좌우 이동량과는 구분하세요."
-              : "영상 위쪽이 0%, 아래쪽이 100%입니다. 실제 높이(cm)가 아닙니다."
-          );
-
-      renderSkeleton();
-      renderFeedback(series);
-    }
-
-    function mount() {
-      const content = main.querySelector("#rp-content");
-      if (!content) return;
-
-      if (unbindSeek) {
-        unbindSeek();
-        unbindSeek = null;
-      }
-
-      content.querySelector("#rx-explorer")?.remove();
-      content.querySelector("#rx-feedback")?.remove();
-
-      // 이전 자동 문구를 연구 근거 피드백으로 대체합니다.
-      for (const section of [...content.children]) {
-        const title = section.querySelector("h2")?.textContent?.trim();
-
-        if (
-          title === "자동 코치 피드백" ||
-          title === "다음 훈련을 위한 제안"
-        ) {
-          section.remove();
-        }
-      }
-
-      content.insertAdjacentHTML("afterbegin", `
-        <section id="rx-explorer" class="panel report-section"
-          style="margin-bottom:18px">
-          <h2>원하는 부위의 스켈레톤 변화</h2>
-
-          <div class="grid g3 no-print">
-            <label>
-              부위
-              <select id="rx-part">
-                ${Object.entries(parts).map(([key, part]) => `
-                  <option value="${key}"
-                    ${key === state.part ? "selected" : ""}>
-                    ${part.name}
-                  </option>
-                `).join("")}
-              </select>
-            </label>
-
-            <label>
-              방향
-              <select id="rx-side">
-                <option value="both">좌우 모두</option>
-                <option value="left">왼쪽만</option>
-                <option value="right">오른쪽만</option>
-              </select>
-            </label>
-
-            <label>
-              그래프 내용
-              <select id="rx-mode">
-                <option value="angle">각도 변화</option>
-                <option value="x">가로 위치 변화</option>
-                <option value="y">세로 위치 변화</option>
-              </select>
-            </label>
-          </div>
-
-          <div class="grid g3 no-print" style="margin-top:12px">
-            <label>
-              시작 초
-              <input id="rx-start" type="number" step="0.01"
-                value="${state.start}">
-            </label>
-            <label>
-              종료 초
-              <input id="rx-end" type="number" step="0.01"
-                value="${state.end}">
-            </label>
-            <label>
-              기준점 인식 필터
-              <select id="rx-confidence">
-                <option value="0.55">기본 · 0.55 이상</option>
-                <option value="0.75">엄격 · 0.75 이상</option>
-                <option value="0.9">매우 엄격 · 0.90 이상</option>
-              </select>
-            </label>
-          </div>
-
-          <div class="row no-print"
-            style="margin:14px 0;gap:12px;flex-wrap:wrap">
-            <label>
-              <input id="rx-smooth" type="checkbox"
-                ${state.smooth ? "checked" : ""}>
-              보기용 평균선
-            </label>
-            <button id="rx-full">전체 구간</button>
-          </div>
-
-          <p class="muted">
-            인식 필터 숫자는 모델의 기준점 가시성 값입니다.
-            정확도 75% 같은 의미가 아닙니다.
-            수동 수정점은 필터와 별도로 유지합니다.
-          </p>
-
-          <div id="rx-chart" class="chart"></div>
-          <p id="rx-note" class="muted"></p>
-
-          <h3 id="rx-frame-label"></h3>
-          <input id="rx-time" type="range"
-            min="${state.start}"
-            max="${Math.max(state.start + 0.01, state.end)}"
-            value="${state.time}" step="0.01"
-            aria-label="스켈레톤 확인 시점"
-            class="no-print" style="width:100%">
-          <div id="rx-skeleton"></div>
-        </section>
-      `);
-
-      content.insertAdjacentHTML("beforeend", `
-        <section id="rx-feedback" class="panel report-section"
-          style="margin-bottom:18px"></section>
-      `);
-
-      main.querySelector("#rx-side").value = state.side;
-      main.querySelector("#rx-mode").value = state.mode;
-      main.querySelector("#rx-confidence").value = String(state.threshold);
-
-      unbindSeek = CM.bindChartSeek(
-        main.querySelector("#rx-chart"),
-        time => {
-          state.time = Math.max(state.start, Math.min(state.end, time));
-          main.querySelector("#rx-time").value = state.time;
-          update();
-        }
-      );
-
-      update();
-    }
-
-    main.addEventListener("change", event => {
-      const id = event.target.id;
-
-      // 기존 리포트의 관절 변경으로 내용이 다시 생성된 경우
-      if (id === "rp-joint" || id === "rp-side") {
-        mount();
-        return;
-      }
-
-      if (id === "rx-part") {
-        state.part = event.target.value;
-
-        if (!parts[state.part].angle && state.mode === "angle") {
-          state.mode = "x";
-          main.querySelector("#rx-mode").value = "x";
-        }
-      } else if (id === "rx-side") {
-        state.side = event.target.value;
-      } else if (id === "rx-mode") {
-        state.mode = event.target.value;
-
-        if (!parts[state.part].angle && state.mode === "angle") {
-          state.mode = "x";
-          event.target.value = "x";
-          CM.toast("손목은 현재 위치 변화를 제공합니다.");
-        }
-      } else if (id === "rx-confidence") {
-        state.threshold = Number(event.target.value);
-      } else if (id === "rx-smooth") {
-        state.smooth = event.target.checked;
-      } else if (id === "rx-start" || id === "rx-end") {
-        const start = Number(main.querySelector("#rx-start").value);
-        const end = Number(main.querySelector("#rx-end").value);
-
-        if (
-          !finite(start) || !finite(end) ||
-          start < samples[0].t ||
-          end > samples[samples.length - 1].t ||
-          end <= start
-        ) {
-          CM.toast("저장된 기록 안에서 올바른 시작·종료 시간을 선택하세요.");
-          main.querySelector("#rx-start").value = state.start;
-          main.querySelector("#rx-end").value = state.end;
-          return;
-        }
-
-        state.start = start;
-        state.end = end;
-        state.time = Math.max(start, Math.min(end, state.time));
-
-        const slider = main.querySelector("#rx-time");
-        slider.min = start;
-        slider.max = end;
-        slider.value = state.time;
-      } else {
-        return;
-      }
-
-      update();
-    }, { signal });
-
-    main.addEventListener("input", event => {
-      if (event.target.id !== "rx-time") return;
-
-      state.time = Number(event.target.value);
-      renderSkeleton();
-    }, { signal });
-
-    main.addEventListener("change", event => {
-      if (event.target.id === "rx-time") update();
-    }, { signal });
-
-    main.addEventListener("click", async event => {
-      if (event.target.closest("#rx-full")) {
-        state.start = samples[0].t;
-        state.end = samples[samples.length - 1].t;
-        state.time = state.start;
-        mount();
-        return;
-      }
-
-      if (!event.target.closest("#rx-training")) return;
-
-      // 기존 리포트의 저장 처리는 이동 시 기존 guard가 확인합니다.
-      // 메모를 자동으로 덮어쓰거나 저장 완료를 가정하지 않습니다.
-      const coachPriority =
-        main.querySelector("#rp-priorities")?.value?.trim() || "";
-      const coachGoal =
-        main.querySelector("#rp-goal")?.value?.trim() || "";
-
-      CM.selectedAthlete = record.athleteId || "";
-
-      CM.trainingDraft = {
-        athleteId: record.athleteId || "",
-        athleteName: record.athleteName || "게스트",
-        sourceRecordId: record.id,
-        reason: [
-          currentObservation,
-          research.interpretation,
-          coachPriority && `코치 메모: ${coachPriority}`
-        ].filter(Boolean).join("\n\n"),
-        goal: [
-          research.practice,
-          research.practiceLimit,
-          coachGoal && `코치 목표: ${coachGoal}`,
-          research.papers.map(paper =>
-            `${paper.author} (${paper.year}) ${paper.url}`
-          ).join("\n")
-        ].filter(Boolean).join("\n\n")
-      };
-
-      location.hash = "training";
-    }, { signal });
-
-    CM.reportsCleanup = () => {
-      controller.abort();
-
-      if (unbindSeek) {
-        unbindSeek();
-        unbindSeek = null;
-      }
-
-      if (typeof previousCleanup === "function") {
-        previousCleanup();
-      }
-
-      CM.reportsCleanup = null;
-    };
-
-    mount();
   };
 })();
