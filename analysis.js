@@ -1,380 +1,358 @@
-/* =========================================================
-   실버스타 스포츠 과학원 · CODEON MOTION
+/* 실버스타 스포츠 과학원 · CODEON MOTION
    analysis.js
 
-   카메라 / 영상 업로드 / 2D 관절 인식
-   스켈레톤 / 각도 / 기준선 / 좌우 선택
-   그래프 / 구간 반복 / 수동 보정 / 장면 저장
-   반복 구간 / 분석 저장
+   - 카메라 연결 / 전면·후면 전환
+   - 영상 업로드 / 구간 분석
+   - 2D 스켈레톤 / 각도 / 기준선 / 궤적
+   - 좌우·관절 선택 / 그래프
+   - 수동 기준점 수정 / 실행 취소·다시 실행
+   - 수동 바벨 기준점
+   - 실험적 반복 감지 / 수동 반복 구간
+   - 동작 사진 / 원본 영상 선택 저장
 
-   자동 인식: MediaPipe Pose Landmarker
-   바벨: 현재 프레임의 위치를 직접 표시하는 수동 방식
+   카메라 영상 자체는 녹화하지 않습니다.
+   카메라는 분석값과 캡처 사진을 저장합니다.
+*/
 
-   측정값은 2D 영상 좌표 기준입니다.
-   실제 3D 각도·무게중심·관절 부하가 아닙니다.
-   ========================================================= */
+(() => {
+  "use strict";
 
-"use strict";
+  window.CM = window.CM || {};
+  const CM = window.CM;
 
-window.CM = window.CM || {};
+  const esc = value => CM.escape(String(value ?? ""));
+  const finite = Number.isFinite;
+  const clamp = (value, min, max) =>
+    Math.max(min, Math.min(max, value));
 
-/* ---------------------------------------------------------
-   관절 정의
-   각도는 A-B-C의 내부각입니다.
-   --------------------------------------------------------- */
-
-CM.poseJoints = {
-  shoulder: {
-    name: "어깨",
-    left: [23, 11, 13],
-    right: [24, 12, 14]
-  },
-
-  elbow: {
-    name: "팔꿈치",
-    left: [11, 13, 15],
-    right: [12, 14, 16]
-  },
-
-  hip: {
-    name: "고관절",
-    left: [11, 23, 25],
-    right: [12, 24, 26]
-  },
-
-  knee: {
-    name: "무릎",
-    left: [23, 25, 27],
-    right: [24, 26, 28]
-  },
-
-  ankle: {
-    name: "발목",
-    left: [25, 27, 31],
-    right: [26, 28, 32]
-  }
-};
-
-CM.posePointNames = {
-  11: "왼쪽 어깨",
-  12: "오른쪽 어깨",
-  13: "왼쪽 팔꿈치",
-  14: "오른쪽 팔꿈치",
-  15: "왼쪽 손목",
-  16: "오른쪽 손목",
-  23: "왼쪽 고관절",
-  24: "오른쪽 고관절",
-  25: "왼쪽 무릎",
-  26: "오른쪽 무릎",
-  27: "왼쪽 발목",
-  28: "오른쪽 발목",
-  29: "왼쪽 뒤꿈치",
-  30: "오른쪽 뒤꿈치",
-  31: "왼쪽 발끝",
-  32: "오른쪽 발끝"
-};
-
-/* ---------------------------------------------------------
-   측정 계산
-   정규화 좌표를 영상 픽셀 비율로 환산합니다.
-   --------------------------------------------------------- */
-
-CM.posePointValid = function (point) {
-  return Boolean(
-    point &&
-    Number.isFinite(point.x) &&
-    Number.isFinite(point.y) &&
-    (
-      point.manual ||
-      (point.visibility ?? 0) >= 0.55
-    )
-  );
-};
-
-CM.angle2D = function (a, b, c, width, height) {
-  if (![a, b, c].every(CM.posePointValid)) {
-    return null;
-  }
-
-  const ax = (a.x - b.x) * width;
-  const ay = (a.y - b.y) * height;
-  const cx = (c.x - b.x) * width;
-  const cy = (c.y - b.y) * height;
-
-  const lengthA = Math.hypot(ax, ay);
-  const lengthC = Math.hypot(cx, cy);
-
-  if (lengthA < 0.001 || lengthC < 0.001) {
-    return null;
-  }
-
-  const cosine = CM.clamp(
-    (ax * cx + ay * cy) / (lengthA * lengthC),
-    -1,
-    1
-  );
-
-  return Math.acos(cosine) * 180 / Math.PI;
-};
-
-CM.measurePose = function (points, width, height) {
-  const angles = {};
-
-  for (const [joint, definition] of Object.entries(
-    CM.poseJoints
-  )) {
-    for (const side of ["left", "right"]) {
-      const ids = definition[side];
-
-      angles[side + "_" + joint] = CM.angle2D(
-        points[ids[0]],
-        points[ids[1]],
-        points[ids[2]],
-        width,
-        height
-      );
-    }
-  }
-
-  const metrics = {
-    left_trunk: null,
-    right_trunk: null,
-    shoulderTilt: null,
-    hipTilt: null,
-    pelvisX: null,
-    pelvisY: null,
-    left_kneeToe: null,
-    right_kneeToe: null
+  const jointNames = {
+    knee: "무릎",
+    hip: "고관절",
+    ankle: "발목",
+    elbow: "팔꿈치",
+    shoulder: "어깨"
   };
 
-  for (const [side, shoulder, hip, knee, toe] of [
-    ["left", 11, 23, 25, 31],
-    ["right", 12, 24, 26, 32]
-  ]) {
-    if (
-      CM.posePointValid(points[shoulder]) &&
-      CM.posePointValid(points[hip])
-    ) {
-      const dx =
-        (points[shoulder].x - points[hip].x) * width;
-
-      const dy =
-        (points[hip].y - points[shoulder].y) * height;
-
-      metrics[side + "_trunk"] =
-        Math.atan2(Math.abs(dx), dy) * 180 / Math.PI;
+  CM.poseJoints = {
+    shoulder: {
+      left: [23, 11, 13],
+      right: [24, 12, 14]
+    },
+    elbow: {
+      left: [11, 13, 15],
+      right: [12, 14, 16]
+    },
+    hip: {
+      left: [11, 23, 25],
+      right: [12, 24, 26]
+    },
+    knee: {
+      left: [23, 25, 27],
+      right: [24, 26, 28]
+    },
+    ankle: {
+      left: [25, 27, 31],
+      right: [26, 28, 32]
     }
+  };
 
-    if (
-      CM.posePointValid(points[knee]) &&
-      CM.posePointValid(points[toe])
-    ) {
-      metrics[side + "_kneeToe"] =
-        (points[knee].x - points[toe].x) * width;
-    }
-  }
+  CM.posePointNames = {
+    11: "왼쪽 어깨",
+    12: "오른쪽 어깨",
+    13: "왼쪽 팔꿈치",
+    14: "오른쪽 팔꿈치",
+    15: "왼쪽 손목",
+    16: "오른쪽 손목",
+    23: "왼쪽 고관절",
+    24: "오른쪽 고관절",
+    25: "왼쪽 무릎",
+    26: "오른쪽 무릎",
+    27: "왼쪽 발목",
+    28: "오른쪽 발목",
+    29: "왼쪽 뒤꿈치",
+    30: "오른쪽 뒤꿈치",
+    31: "왼쪽 발끝",
+    32: "오른쪽 발끝"
+  };
 
-  function lineTilt(first, second) {
+  const connections = [
+    [11, 12],
+    [11, 13], [13, 15],
+    [12, 14], [14, 16],
+    [11, 23], [12, 24],
+    [23, 24],
+    [23, 25], [25, 27],
+    [24, 26], [26, 28],
+    [27, 29], [29, 31], [27, 31],
+    [28, 30], [30, 32], [28, 32]
+  ];
+
+  const leftPoints = new Set([
+    11, 13, 15, 23, 25, 27, 29, 31
+  ]);
+
+  const rightPoints = new Set([
+    12, 14, 16, 24, 26, 28, 30, 32
+  ]);
+
+  CM.posePointValid = point =>
+    Boolean(
+      point &&
+      finite(point.x) &&
+      finite(point.y) &&
+      (
+        point.manual ||
+        (finite(point.visibility) && point.visibility >= 0.55)
+      )
+    );
+
+  CM.angle2D = (a, b, c, width = 1, height = 1) => {
     if (
-      !CM.posePointValid(points[first]) ||
-      !CM.posePointValid(points[second])
+      !CM.posePointValid(a) ||
+      !CM.posePointValid(b) ||
+      !CM.posePointValid(c)
     ) {
       return null;
     }
 
-    const dx =
-      (points[second].x - points[first].x) * width;
+    const ux = (a.x - b.x) * width;
+    const uy = (a.y - b.y) * height;
+    const vx = (c.x - b.x) * width;
+    const vy = (c.y - b.y) * height;
 
-    const dy =
-      (points[second].y - points[first].y) * height;
+    const length = Math.hypot(ux, uy) * Math.hypot(vx, vy);
+    if (length < 1e-8) return null;
 
-    let angle = Math.atan2(dy, dx) * 180 / Math.PI;
+    return Math.acos(
+      clamp((ux * vx + uy * vy) / length, -1, 1)
+    ) * 180 / Math.PI;
+  };
 
-    if (angle > 90) angle -= 180;
-    if (angle < -90) angle += 180;
+  CM.measurePose = (points, width, height) => {
+    const angles = {};
+    const metrics = {};
 
-    return angle;
-  }
-
-  metrics.shoulderTilt = lineTilt(11, 12);
-  metrics.hipTilt = lineTilt(23, 24);
-
-  if (
-    CM.posePointValid(points[23]) &&
-    CM.posePointValid(points[24])
-  ) {
-    metrics.pelvisX =
-      (points[23].x + points[24].x) * 50;
-
-    metrics.pelvisY =
-      (points[23].y + points[24].y) * 50;
-  }
-
-  return { angles, metrics };
-};
-
-/* ---------------------------------------------------------
-   설정형 반복 구간 검출
-
-   높은 각도 → 낮은 각도 → 높은 각도
-   측정 누락이 길면 진행 중인 반복을 취소합니다.
-   --------------------------------------------------------- */
-
-CM.detectRepetitions = function (
-  samples,
-  {
-    key = "left_knee",
-    low = 100,
-    high = 155,
-    minDuration = 0.5,
-    maxGap = 0.8
-  } = {}
-) {
-  if (
-    !Number.isFinite(low) ||
-    !Number.isFinite(high) ||
-    low >= high
-  ) {
-    return [];
-  }
-
-  const ordered = [...samples].sort((a, b) => a.t - b.t);
-  const repetitions = [];
-
-  let state = "waiting";
-  let start = null;
-  let bottom = null;
-  let minimum = Infinity;
-  let lastValidTime = null;
-
-  for (const sample of ordered) {
-    const value = sample.angles?.[key];
-
-    if (!Number.isFinite(value)) {
-      continue;
+    for (const [joint, sides] of Object.entries(CM.poseJoints)) {
+      for (const [side, ids] of Object.entries(sides)) {
+        angles[`${side}_${joint}`] = CM.angle2D(
+          points[ids[0]],
+          points[ids[1]],
+          points[ids[2]],
+          width,
+          height
+        );
+      }
     }
+
+    for (const side of ["left", "right"]) {
+      const shoulder = points[side === "left" ? 11 : 12];
+      const hip = points[side === "left" ? 23 : 24];
+
+      metrics[`${side}_trunk`] =
+        CM.posePointValid(shoulder) && CM.posePointValid(hip)
+          ? Math.atan2(
+              Math.abs((shoulder.x - hip.x) * width),
+              (hip.y - shoulder.y) * height
+            ) * 180 / Math.PI
+          : null;
+
+      const knee = points[side === "left" ? 25 : 26];
+      const toe = points[side === "left" ? 31 : 32];
+
+      metrics[`${side}_kneeToe`] =
+        CM.posePointValid(knee) && CM.posePointValid(toe)
+          ? (knee.x - toe.x) * width
+          : null;
+    }
+
+    function tilt(a, b) {
+      if (!CM.posePointValid(a) || !CM.posePointValid(b)) {
+        return null;
+      }
+
+      let value = Math.atan2(
+        (b.y - a.y) * height,
+        (b.x - a.x) * width
+      ) * 180 / Math.PI;
+
+      if (value > 90) value -= 180;
+      if (value < -90) value += 180;
+
+      return value;
+    }
+
+    metrics.shoulderTilt = tilt(points[11], points[12]);
+    metrics.hipTilt = tilt(points[23], points[24]);
 
     if (
-      lastValidTime !== null &&
-      sample.t - lastValidTime > maxGap
+      CM.posePointValid(points[23]) &&
+      CM.posePointValid(points[24])
     ) {
-      state = "waiting";
-      start = null;
-      bottom = null;
-      minimum = Infinity;
+      metrics.pelvisX = (points[23].x + points[24].x) * 50;
+      metrics.pelvisY = (points[23].y + points[24].y) * 50;
+    } else {
+      metrics.pelvisX = null;
+      metrics.pelvisY = null;
     }
 
-    lastValidTime = sample.t;
+    return { angles, metrics };
+  };
 
-    if (state === "waiting") {
-      if (value >= high) {
-        state = "ready";
-        start = sample.t;
+  CM.detectRepetitions = (
+    samples,
+    {
+      key = "left_knee",
+      low = 100,
+      high = 155,
+      minDuration = 0.5,
+      maxGap = 0.8
+    } = {}
+  ) => {
+    if (!finite(low) || !finite(high) || low >= high) return [];
+
+    const sorted = samples
+      .filter(sample => finite(sample.t))
+      .slice()
+      .sort((a, b) => a.t - b.t);
+
+    const repetitions = [];
+
+    let ready = false;
+    let moving = false;
+    let start = 0;
+    let bottom = 0;
+    let minimum = Infinity;
+    let lastTime = null;
+
+    for (const sample of sorted) {
+      const value = sample.angles?.[key];
+
+      if (
+        !finite(value) ||
+        (lastTime !== null && sample.t - lastTime > maxGap)
+      ) {
+        ready = false;
+        moving = false;
+        minimum = Infinity;
       }
 
-      continue;
-    }
+      lastTime = sample.t;
+      if (!finite(value)) continue;
 
-    if (state === "ready") {
-      if (value >= high) {
+      if (!ready && value >= high) {
+        ready = true;
         start = sample.t;
+        continue;
       }
 
-      if (value <= low) {
-        state = "moving";
-        bottom = sample.t;
+      if (!ready) continue;
+
+      if (!moving) {
+        if (value >= high) start = sample.t;
+
+        if (value <= low) {
+          moving = true;
+          bottom = sample.t;
+          minimum = value;
+        }
+
+        continue;
+      }
+
+      if (value < minimum) {
         minimum = value;
+        bottom = sample.t;
       }
 
-      continue;
-    }
+      if (value >= high) {
+        const duration = sample.t - start;
 
-    if (value < minimum) {
-      minimum = value;
-      bottom = sample.t;
-    }
+        if (duration >= minDuration) {
+          repetitions.push({
+            start,
+            bottom,
+            end: sample.t,
+            duration,
+            downTime: bottom - start,
+            upTime: sample.t - bottom,
+            minAngle: minimum,
+            source: "experimental-auto",
+            key
+          });
+        }
 
-    if (value >= high) {
-      if (sample.t - start >= minDuration) {
-        repetitions.push({
-          id: CM.uid(),
-          start,
-          bottom,
-          end: sample.t,
-          duration: sample.t - start,
-          downTime: bottom - start,
-          upTime: sample.t - bottom,
-          minAngle: minimum,
-          source: "experimental-auto",
-          key
-        });
+        moving = false;
+        start = sample.t;
+        minimum = Infinity;
       }
-
-      state = "ready";
-      start = sample.t;
-      bottom = null;
-      minimum = Infinity;
     }
+
+    return repetitions;
+  };
+
+  function clone(value) {
+    return JSON.parse(JSON.stringify(value));
   }
 
-  return repetitions;
-};
+  CM.renderAnalysis = async () => {
+    if (typeof CM.analysisCleanup === "function") {
+      CM.analysisCleanup();
+    }
 
-/* ---------------------------------------------------------
-   분석 화면
-   --------------------------------------------------------- */
-
-CM.renderAnalysis = async function () {
-  if (typeof CM.loadExercises === "function") {
     await CM.loadExercises();
-  }
 
-  const athleteOptions = await CM.athleteOptions();
-  const selectedExercise = CM.exerciseById(
-    CM.selectedExercise
-  );
+    const athletes = await CM.db.all("athletes");
+    const main = document.querySelector("#main");
 
-  const main = document.querySelector("#main");
+    const selectedExercise =
+      CM.exercises.find(item => item.id === CM.selectedExercise) ||
+      CM.exercises[0];
 
-  main.innerHTML =
-    CM.heading(
-      "자세 분석",
-      "MOTION ANALYSIS",
-      `<span class="badge">2D 영상 좌표 분석</span>`
-    ) +
-    `
+    if (!selectedExercise) {
+      main.innerHTML = CM.empty("등록된 운동이 없습니다.");
+      return;
+    }
+
+    main.innerHTML = `
+      ${CM.heading(
+        "자세 분석",
+        "SILVERSTAR · MOTION ANALYSIS",
+        `
+          <button id="an-save" class="primary">분석 저장</button>
+          <button id="an-report">저장 후 리포트</button>
+        `
+      )}
+
       <div class="analysis-layout">
-        <section class="panel stack">
+        <aside class="panel">
           <h2>분석 설정</h2>
 
           <label>
             선수
             <select id="an-athlete">
-              ${athleteOptions}
-            </select>
-          </label>
-
-          <label>
-            운동
-            <select id="an-exercise">
-              ${CM.categories.map(category => `
-                <optgroup label="${category}">
-                  ${CM.exercises
-                    .filter(ex => ex.category === category)
-                    .map(ex => `
-                      <option
-                        value="${CM.escape(ex.id)}"
-                        ${ex.id === selectedExercise.id ? "selected" : ""}
-                      >
-                        ${CM.escape(ex.name)}
-                      </option>
-                    `).join("")}
-                </optgroup>
+              <option value="">게스트</option>
+              ${athletes.map(athlete => `
+                <option value="${esc(athlete.id)}"
+                  ${athlete.id === CM.selectedAthlete ? "selected" : ""}>
+                  ${esc(athlete.name)}
+                </option>
               `).join("")}
             </select>
           </label>
 
-          <label>
+          <label style="display:block;margin-top:12px">
+            운동
+            <select id="an-exercise">
+              ${CM.exercises.map(exercise => `
+                <option value="${esc(exercise.id)}"
+                  ${exercise.id === selectedExercise.id ? "selected" : ""}>
+                  ${esc(exercise.category)} · ${esc(exercise.name)}
+                </option>
+              `).join("")}
+            </select>
+          </label>
+
+          <label style="display:block;margin-top:12px">
             촬영 방향
             <select id="an-view">
               <option value="side">측면</option>
@@ -383,176 +361,151 @@ CM.renderAnalysis = async function () {
             </select>
           </label>
 
-          <p id="an-guide" class="notice"></p>
-
-          <div class="form-grid">
+          <div class="grid g2" style="margin-top:12px">
             <label>
-              중량 · kg
-              <input
-                id="an-load"
-                type="number"
-                min="0"
-                max="1000"
-                step="0.5"
-                placeholder="선택"
-              >
+              중량 kg
+              <input id="an-weight" type="number"
+                min="0" max="1000" step="0.5" placeholder="선택">
             </label>
-
             <label>
-              목표 횟수
-              <input
-                id="an-target"
-                type="number"
-                min="1"
-                max="999"
-                step="1"
-                value="10"
-              >
+              목표 반복
+              <input id="an-target" type="number"
+                min="1" max="9999" step="1" placeholder="선택">
             </label>
           </div>
 
-          <label>
-            카메라
-            <select id="an-facing">
-              <option value="environment">후면 카메라 우선</option>
-              <option value="user">전면 카메라 우선</option>
-            </select>
-          </label>
+          <hr>
 
-          <button id="an-camera" class="primary">
+          <button id="an-camera" class="primary"
+            style="width:100%">
             카메라 연결
           </button>
 
-          <button id="an-camera-stop">
-            카메라 종료
+          <button id="an-switch"
+            style="width:100%;margin-top:8px">
+            전면 / 후면 전환
           </button>
+
+          <p id="an-camera-label" class="muted">
+            선택 카메라: 후면
+          </p>
 
           <label>
             영상 업로드
             <input id="an-file" type="file" accept="video/*">
           </label>
 
-          <label class="row">
+          <label style="display:flex;gap:8px;margin-top:12px">
             <input id="an-keep-media" type="checkbox">
-            업로드한 원본 영상을 기기에 함께 저장
+            업로드 원본도 브라우저에 저장
           </label>
 
-          <button id="an-model">
-            자동 관절 인식 준비
-          </button>
-
-          <button id="an-scan">
-            전체 영상 분석 · 10Hz
-          </button>
-
-          <button id="an-cancel-scan" disabled>
-            전체 분석 중지
-          </button>
-
-          <p id="an-status" class="notice" role="status">
-            영상을 업로드하거나 카메라를 연결하세요.
+          <p class="muted" style="font-size:12px">
+            카메라 영상은 녹화하지 않습니다.
+            분석값과 캡처 사진을 저장합니다.
           </p>
 
-          <details>
-            <summary>자동 반복 설정 · 실험</summary>
+          <hr>
 
-            <div class="stack">
-              <label>
-                기준 관절
-                <select id="an-rep-key">
-                  ${Object.entries(CM.poseJoints).map(
-                    ([key, joint]) => `
-                      <option value="left_${key}">
-                        왼쪽 ${joint.name}
-                      </option>
-                      <option value="right_${key}">
-                        오른쪽 ${joint.name}
-                      </option>
-                    `
-                  ).join("")}
-                </select>
-              </label>
+          <h3>분석 구간</h3>
 
-              <label>
-                낮은 각도 기준
-                <input
-                  id="an-low"
-                  type="number"
-                  min="0"
-                  max="179"
-                  value="100"
-                >
-              </label>
+          <div class="grid g2">
+            <label>
+              시작 초
+              <input id="an-range-start" type="number"
+                value="0" min="0" step="0.1">
+            </label>
+            <label>
+              종료 초
+              <input id="an-range-end" type="number"
+                min="0" step="0.1" placeholder="영상 끝">
+            </label>
+          </div>
 
-              <label>
-                높은 각도 기준
-                <input
-                  id="an-high"
-                  type="number"
-                  min="1"
-                  max="180"
-                  value="155"
-                >
-              </label>
+          <button id="an-scan"
+            style="width:100%;margin-top:10px">
+            업로드 영상 구간 분석
+          </button>
 
-              <button id="an-recount">
-                반복 다시 계산
-              </button>
+          <button id="an-cancel"
+            style="width:100%;margin-top:8px" hidden>
+            구간 분석 중단
+          </button>
 
-              <p class="notice">
-                높은 각도 → 낮은 각도 → 높은 각도를
-                한 반복으로 판단합니다.
-                모든 운동에 같은 기준이 맞지는 않습니다.
-              </p>
-            </div>
-          </details>
+          <label style="display:flex;gap:8px;margin-top:10px">
+            <input id="an-loop" type="checkbox">
+            지정 구간 반복 재생
+          </label>
 
-          <details>
-            <summary>측정 정의</summary>
+          <hr>
 
-            <p class="notice">
-              무릎: 고관절–무릎–발목 내부각<br>
-              고관절: 어깨–고관절–무릎 내부각<br>
-              팔꿈치: 어깨–팔꿈치–손목 내부각<br>
-              어깨: 고관절–어깨–팔꿈치 내부각<br>
-              발목: 무릎–발목–발끝 내부각<br>
-              몸통: 영상 수직선 대비 기울기
-            </p>
+          <h3>자동 반복 감지 · 실험</h3>
 
-            <p class="notice">
-              발목 값은 영상상 세 점의 각도이며
-              임상적 발목 배측굴곡 측정과 동일하지 않습니다.
-              좌우는 운동하는 사람의 신체 기준입니다.
-            </p>
-          </details>
-        </section>
+          <label>
+            기준 관절
+            <select id="an-rep-key">
+              ${Object.entries(jointNames).map(([key, name]) => `
+                <option value="left_${key}">왼쪽 ${name}</option>
+                <option value="right_${key}">오른쪽 ${name}</option>
+              `).join("")}
+            </select>
+          </label>
+
+          <div class="grid g2" style="margin-top:10px">
+            <label>
+              굽힌 각도 이하
+              <input id="an-low" type="number"
+                min="0" max="180" value="100">
+            </label>
+            <label>
+              편 각도 이상
+              <input id="an-high" type="number"
+                min="0" max="180" value="155">
+            </label>
+          </div>
+
+          <p class="muted" style="font-size:12px">
+            큰 각도 → 작은 각도 → 큰 각도 순서를 감지합니다.
+            모든 운동에 맞는 기준은 아닙니다.
+            운동에 맞게 조정하거나 수동 구간을 사용하세요.
+          </p>
+
+          <label>
+            메모
+            <textarea id="an-memo" rows="4"></textarea>
+          </label>
+        </aside>
 
         <div>
-          <section class="panel">
-            <div id="an-stage" class="stage">
-              <video
-                id="an-video"
-                playsinline
-                muted
-                preload="metadata"
-              ></video>
-
-              <canvas id="an-canvas"></canvas>
-
-              <div id="an-empty" class="stage-empty">
-                <div>
-                  <h2>MOTION CAPTURE</h2>
-                  <p>카메라 또는 운동 영상을 연결하세요.</p>
-                </div>
+          <section class="panel" style="margin-bottom:18px">
+            <div id="an-stage" class="stage"
+              style="aspect-ratio:16/9;position:relative;
+                     overflow:hidden;background:#030b11">
+              <video id="an-video" muted playsinline
+                style="width:100%;height:100%;display:block;
+                       object-fit:fill"></video>
+              <canvas id="an-canvas"
+                style="position:absolute;inset:0;width:100%;height:100%;
+                       touch-action:none"></canvas>
+              <div id="an-placeholder"
+                style="position:absolute;inset:0;display:grid;
+                       place-items:center;pointer-events:none">
+                <p class="muted">카메라를 연결하거나 영상을 선택하세요.</p>
               </div>
             </div>
 
-            <div class="video-controls">
+            <p id="an-status" role="status" class="muted">
+              분석 준비
+            </p>
+
+            <div class="row no-print"
+              style="gap:8px;flex-wrap:wrap">
               <button id="an-back">−0.1초</button>
               <button id="an-play">재생 / 일시정지</button>
-              <button id="an-forward">+0.1초</button>
+              <button id="an-next">+0.1초</button>
 
-              <select id="an-speed" aria-label="재생 속도">
+              <select id="an-speed" aria-label="재생 속도"
+                style="width:auto">
                 <option value="0.25">0.25배</option>
                 <option value="0.5">0.5배</option>
                 <option value="1" selected>1배</option>
@@ -560,1893 +513,1839 @@ CM.renderAnalysis = async function () {
                 <option value="2">2배</option>
               </select>
 
-              <span id="an-time" class="muted">0.0s</span>
+              <button id="an-snapshot">동작 사진 저장</button>
             </div>
 
-            <input
-              id="an-seek"
-              type="range"
-              min="0"
-              max="1"
-              step="0.01"
-              value="0"
-              aria-label="영상 시점"
-              disabled
-            >
+            <input id="an-seek" type="range"
+              min="0" max="1" step="0.01" value="0"
+              aria-label="영상 탐색" style="width:100%;margin-top:12px">
 
-            <div class="toggles" style="margin-top:14px">
-              ${[
-                ["skeleton", "스켈레톤", true],
-                ["points", "관절점", true],
-                ["angles", "각도", true],
-                ["guides", "기준선", true],
-                ["trail", "궤적", false],
-                ["ghost", "기준 자세", false]
-              ].map(([key, name, checked]) => `
+            <div class="toggles row"
+              style="gap:12px;flex-wrap:wrap;margin-top:14px">
+              <label><input id="an-skeleton" type="checkbox" checked>
+                스켈레톤
+              </label>
+              <label><input id="an-angles" type="checkbox" checked>
+                각도
+              </label>
+              <label><input id="an-guides" type="checkbox" checked>
+                기준선
+              </label>
+              <label><input id="an-trails" type="checkbox">
+                궤적
+              </label>
+              <label><input id="an-ghost" type="checkbox">
+                기준 자세
+              </label>
+            </div>
+
+            <div class="grid g3" style="margin-top:14px">
+              <label>
+                표시 방향
+                <select id="an-side">
+                  <option value="both">좌우 모두</option>
+                  <option value="left">왼쪽만</option>
+                  <option value="right">오른쪽만</option>
+                </select>
+              </label>
+              <label>
+                기준선 높이 %
+                <input id="an-floor" type="number"
+                  min="0" max="100" value="85">
+              </label>
+              <div>
+                <button id="an-set-ghost" style="margin-top:20px">
+                  현재 자세를 기준으로
+                </button>
+              </div>
+            </div>
+
+            <div class="toggles row"
+              style="margin-top:14px;gap:12px;flex-wrap:wrap">
+              ${Object.entries(jointNames).map(([key, name]) => `
                 <label>
-                  <input
-                    type="checkbox"
-                    data-overlay="${key}"
-                    ${checked ? "checked" : ""}
-                  >
+                  <input type="checkbox" data-joint="${key}" checked>
                   ${name}
                 </label>
               `).join("")}
             </div>
-
-            <div class="row" style="margin-top:14px">
-              <select
-                id="an-side"
-                aria-label="신체 좌우 선택"
-                style="width:130px"
-              >
-                <option value="both">양쪽</option>
-                <option value="left">왼쪽</option>
-                <option value="right">오른쪽</option>
-              </select>
-
-              <button id="an-all-joints" class="small">
-                전체 선택
-              </button>
-
-              <button id="an-no-joints" class="small">
-                전체 해제
-              </button>
-
-              <button id="an-reference" class="small">
-                현재 자세를 기준으로
-              </button>
-
-              <button id="an-snapshot" class="small">
-                장면 저장
-              </button>
-            </div>
-
-            <div
-              id="an-joints"
-              class="toggles"
-              style="margin-top:12px"
-            >
-              ${Object.entries(CM.poseJoints).map(
-                ([key, joint]) => `
-                  <label>
-                    <input
-                      type="checkbox"
-                      data-joint="${key}"
-                      ${["hip", "knee", "ankle"].includes(key) ? "checked" : ""}
-                    >
-                    ${joint.name}
-                  </label>
-                `
-              ).join("")}
-            </div>
-
-            <details style="margin-top:16px">
-              <summary>수동 보정·기준선·구간 설정</summary>
-
-              <div class="stack">
-                <div class="row">
-                  <label>
-                    편집 도구
-                    <select id="an-tool">
-                      <option value="view">보기</option>
-                      <option value="joint">선택 관절점 보정</option>
-                      <option value="bar">바벨 위치 지정</option>
-                    </select>
-                  </label>
-
-                  <label>
-                    보정할 관절점
-                    <select id="an-edit-point">
-                      ${Object.entries(CM.posePointNames).map(
-                        ([id, name]) => `
-                          <option value="${id}">${name}</option>
-                        `
-                      ).join("")}
-                    </select>
-                  </label>
-
-                  <button id="an-undo">되돌리기</button>
-                  <button id="an-redo">다시 실행</button>
-                </div>
-
-                <p class="notice">
-                  영상을 멈춘 뒤 관절점을 선택하고
-                  영상 위 위치를 누르거나 드래그하세요.
-                  보정은 현재 0.1초 구간에만 적용됩니다.
-                  바벨도 필요한 장면마다 직접 표시합니다.
-                </p>
-
-                <div class="form-grid">
-                  <label>
-                    바닥 기준선 높이 · %
-                    <input
-                      id="an-floor"
-                      type="range"
-                      min="0"
-                      max="100"
-                      value="90"
-                    >
-                  </label>
-
-                  <label>
-                    기준선 기울기 · °
-                    <input
-                      id="an-floor-angle"
-                      type="number"
-                      min="-45"
-                      max="45"
-                      value="0"
-                    >
-                  </label>
-                </div>
-
-                <div class="row">
-                  <button id="an-mark-a">구간 시작 A</button>
-                  <button id="an-mark-b">구간 종료 B</button>
-
-                  <label>
-                    <input id="an-loop" type="checkbox">
-                    A–B 반복
-                  </label>
-
-                  <button id="an-add-rep">
-                    A–B를 수동 반복으로 추가
-                  </button>
-
-                  <button id="an-clear-reps">
-                    수동 반복 초기화
-                  </button>
-                </div>
-
-                <p id="an-range" class="notice">
-                  A — / B —
-                </p>
-              </div>
-            </details>
           </section>
 
-          <section class="panel">
-            <div class="row spread">
-              <h2>관절 각도 변화</h2>
-
-              <span class="badge">
-                표시를 꺼도 측정 기록은 유지
-              </span>
-            </div>
-
-            <div id="an-metrics" class="grid g4"></div>
-
-            <div id="an-chart" style="margin-top:18px"></div>
-
-            <p class="notice">
-              그래프를 누르면 해당 영상 시점으로 이동합니다.
-              인식되지 않은 구간은 연결하지 않습니다.
+          <section class="panel" style="margin-bottom:18px">
+            <h2>관절 각도 변화</h2>
+            <div id="an-values" class="grid g3"></div>
+            <div id="an-chart" class="chart"
+              style="margin-top:16px"></div>
+            <p class="muted">
+              그래프는 선택한 관절과 방향만 표시합니다.
+              업로드 영상에서는 그래프를 눌러 해당 시점으로 이동할 수 있습니다.
             </p>
           </section>
 
-          <section class="panel">
-            <div class="row spread">
-              <h2>분석 저장</h2>
-
-              <span id="an-count" class="badge">
-                측정 0개
-              </span>
-            </div>
-
-            <div id="an-repetitions"></div>
-
-            <div
-              id="an-snapshots"
-              class="grid g3"
-              style="margin-top:16px"
-            ></div>
-
-            <label style="margin-top:16px">
-              분석 메모
-              <textarea
-                id="an-memo"
-                maxlength="3000"
-                placeholder="촬영 조건이나 확인할 사항"
-              ></textarea>
-            </label>
-
-            <div class="row" style="margin-top:16px">
-              <button id="an-save" class="primary">
-                분석 저장
-              </button>
-
-              <button id="an-report">
-                저장 후 리포트
-              </button>
-
-              <button id="an-new" class="danger">
-                새 분석
-              </button>
-            </div>
-
-            <p class="notice">
-              카메라 실시간 영상 자체는 녹화하지 않습니다.
-              측정값과 저장한 장면만 보관합니다.
-              업로드 영상은 원본 저장을 선택한 경우 함께 보관합니다.
+          <section class="panel" style="margin-bottom:18px">
+            <h2>수동 기준점 수정</h2>
+            <p class="muted">
+              일시정지 후 수정할 기준점을 선택하고
+              영상의 위치를 클릭하거나 드래그하세요.
+              손목은 팔꿈치 각도 계산 등에 사용하는 위치 기준점입니다.
             </p>
+
+            <div class="grid g2">
+              <label>
+                편집 모드
+                <select id="an-edit">
+                  <option value="none">편집 안 함</option>
+                  <option value="joint">관절 기준점</option>
+                  <option value="bar">바벨 기준점</option>
+                </select>
+              </label>
+              <label>
+                수정할 관절
+                <select id="an-point">
+                  ${Object.entries(CM.posePointNames).map(([id, name]) => `
+                    <option value="${id}">${name}</option>
+                  `).join("")}
+                </select>
+              </label>
+            </div>
+
+            <div class="row" style="margin-top:12px;gap:8px;flex-wrap:wrap">
+              <button id="an-undo">실행 취소</button>
+              <button id="an-redo">다시 실행</button>
+              <button id="an-clear-bar">현재 바벨 점 삭제</button>
+            </div>
+
+            <p class="muted">
+              바벨 점은 직접 지정합니다.
+              자동 바벨 추적이나 실제 이동 거리 측정은 아닙니다.
+            </p>
+          </section>
+
+          <section class="panel" style="margin-bottom:18px">
+            <div class="row spread" style="gap:10px;flex-wrap:wrap">
+              <h2>반복 구간</h2>
+              <strong id="an-rep-count">0회</strong>
+            </div>
+
+            <div class="row" style="gap:8px;flex-wrap:wrap">
+              <button id="an-mark-start">현재 시점을 시작으로</button>
+              <button id="an-mark-end">현재 시점을 종료로</button>
+              <button id="an-remove-rep">마지막 수동 구간 취소</button>
+              <button id="an-clear-reps">수동 구간 전체 지우기</button>
+            </div>
+
+            <p id="an-mark-label" class="muted">수동 구간 시작점 없음</p>
+            <div id="an-rep-list"></div>
+          </section>
+
+          <section class="panel">
+            <h2>저장할 동작 사진</h2>
+            <p class="muted">최대 12장. 선택한 표시 상태로 저장합니다.</p>
+            <div id="an-snapshots" class="grid g3"></div>
           </section>
         </div>
       </div>
     `;
 
-  const $ = id => document.getElementById(id);
+    const $ = selector => main.querySelector(selector);
+    const video = $("#an-video");
+    const canvas = $("#an-canvas");
+    const context = canvas.getContext("2d");
+    const stage = $("#an-stage");
 
-  const video = $("an-video");
-  const canvas = $("an-canvas");
-  const context = canvas.getContext("2d");
-  const stage = $("an-stage");
+    const controller = new AbortController();
+    const signal = controller.signal;
 
-  const state = {
-    active: true,
-    model: null,
-    modelLoading: null,
-    stream: null,
-    file: null,
-    fileUrl: null,
-    samples: new Map(),
-    current: null,
-    reference: null,
-    snapshots: [],
-    manualReps: [],
-    undo: [],
-    redo: [],
-    dragBefore: null,
-    dragTime: null,
-    scanning: false,
-    cancelScan: false,
-    saving: false,
-    revision: 0,
-    savedRevision: 0,
-    savedId: null,
-    lastTimeKey: null,
-    frameId: null,
-    lastGraphAt: 0,
-    a: null,
-    b: null,
-    width: 1280,
-    height: 720
-  };
+    let active = true;
+    let stream = null;
+    let objectURL = null;
+    let model = null;
+    let modelPromise = null;
 
-  function status(message) {
-    if (state.active) {
-      $("an-status").textContent = message;
-    }
-  }
+    let source = null;
+    let sourceFile = null;
+    let sourceName = "";
+    let facing = "environment";
 
-  function changed() {
-    state.revision += 1;
-  }
+    let cameraStartedAt = 0;
+    let cameraElapsed = 0;
+    let cameraRunning = false;
 
-  function timeKey(time) {
-    return Math.round(time * 10);
-  }
+    let width = 1280;
+    let height = 720;
 
-  function timeNow() {
-    return Number.isFinite(video.currentTime)
-      ? video.currentTime
-      : 0;
-  }
+    let sourceBusy = false;
+    let saving = false;
+    let scanning = false;
+    let cancelScan = false;
+    let dirty = false;
 
-  function samplesArray() {
-    return [...state.samples.values()]
-      .sort((a, b) => a.t - b.t);
-  }
+    let savedId = null;
+    let mediaId = null;
+    let createdAt = null;
 
-  function exercise() {
-    return CM.exerciseById($("an-exercise").value);
-  }
+    let raf = 0;
+    let lastDetectAt = 0;
+    let lastGraphAt = 0;
+    let lastDetectionKey = null;
+    let inferenceFailed = false;
 
-  function selectedSides() {
-    const side = $("an-side").value;
+    let ghost = null;
+    let markStart = null;
 
-    return side === "both"
-      ? ["left", "right"]
-      : [side];
-  }
+    let drag = null;
+    const history = [];
+    const future = [];
+    const samples = new Map();
+    const snapshots = [];
+    const manualRepetitions = [];
 
-  function selectedJoints() {
-    return [...main.querySelectorAll(
-      "[data-joint]:checked"
-    )].map(input => input.dataset.joint);
-  }
+    function on(selector, type, handler) {
+      const node = $(selector);
 
-  function enabled(name) {
-    return main.querySelector(
-      `[data-overlay="${name}"]`
-    ).checked;
-  }
-
-  function currentSample() {
-    return state.samples.get(timeKey(timeNow())) || null;
-  }
-
-  function buildSample(time, points, old = null) {
-    const measured = CM.measurePose(
-      points,
-      state.width,
-      state.height
-    );
-
-    return {
-      t: timeKey(time) / 10,
-      points,
-      angles: measured.angles,
-      metrics: measured.metrics,
-      manual: Boolean(
-        old?.manual ||
-        points.some(point => point?.manual)
-      ),
-      bar: old?.bar || null
-    };
-  }
-
-  function putSample(sample) {
-    state.samples.set(timeKey(sample.t), sample);
-    state.current = sample;
-    changed();
-  }
-
-  function resizeStage() {
-    if (!video.videoWidth || !video.videoHeight) {
-      return;
+      node.addEventListener(type, event => {
+        try {
+          Promise.resolve(handler(event)).catch(showError);
+        } catch (error) {
+          showError(error);
+        }
+      }, { signal });
     }
 
-    state.width = video.videoWidth;
-    state.height = video.videoHeight;
+    function showError(error) {
+      console.error(error);
+      if (!active) return;
 
-    canvas.width = state.width;
-    canvas.height = state.height;
+      const names = {
+        NotAllowedError:
+          "카메라 권한이 허용되지 않았습니다. 사파리의 사이트 카메라 설정을 확인해 주세요.",
+        NotFoundError:
+          "사용 가능한 카메라를 찾지 못했습니다.",
+        NotReadableError:
+          "카메라를 열지 못했습니다. 다른 앱의 카메라 사용을 종료하고 다시 시도해 주세요.",
+        OverconstrainedError:
+          "요청한 카메라 설정을 사용할 수 없습니다."
+      };
 
-    stage.style.minHeight = "0";
-    stage.style.aspectRatio =
-      state.width + " / " + state.height;
+      const text =
+        names[error?.name] ||
+        error?.message ||
+        "작업 중 오류가 발생했습니다.";
 
-    video.style.height = "100%";
-
-    $("an-empty").classList.add("hidden");
-
-    if (!state.stream && Number.isFinite(video.duration)) {
-      $("an-seek").max = String(video.duration);
-      $("an-seek").disabled = false;
+      $("#an-status").textContent = text;
+      CM.toast(text, 6000);
     }
 
-    draw();
-  }
-
-  function line(a, b, color, dash = []) {
-    if (
-      !CM.posePointValid(a) ||
-      !CM.posePointValid(b)
-    ) {
-      return;
+    function status(text) {
+      if (active) $("#an-status").textContent = text;
     }
 
-    context.strokeStyle = color;
-    context.setLineDash(dash);
+    function exercise() {
+      return CM.exercises.find(
+        item => item.id === $("#an-exercise").value
+      ) || selectedExercise;
+    }
 
-    context.beginPath();
-    context.moveTo(a.x * canvas.width, a.y * canvas.height);
-    context.lineTo(b.x * canvas.width, b.y * canvas.height);
-    context.stroke();
+    function sortedSamples() {
+      return [...samples.values()].sort((a, b) => a.t - b.t);
+    }
 
-    context.setLineDash([]);
-  }
+    function keyOf(time) {
+      return Math.round(time * 10);
+    }
 
-  function drawPose(sample, opacity = 1) {
-    if (!sample) return;
+    function currentTime() {
+      if (source === "upload") return video.currentTime || 0;
 
-    const points = sample.points || [];
-    const used = new Set();
+      if (source === "camera") {
+        return cameraElapsed + (
+          cameraRunning
+            ? (performance.now() - cameraStartedAt) / 1000
+            : 0
+        );
+      }
 
-    context.save();
-    context.globalAlpha = opacity;
+      return 0;
+    }
 
-    for (const side of selectedSides()) {
-      const color = side === "left"
-        ? "#50daf2"
-        : "#e691c0";
+    function nearestSample(time, tolerance = 0.2) {
+      const key = keyOf(time);
+      let best = null;
+      let distance = Infinity;
 
-      for (const joint of selectedJoints()) {
-        const ids = CM.poseJoints[joint][side];
-        const [a, b, c] = ids.map(id => points[id]);
+      for (let offset = -2; offset <= 2; offset++) {
+        const sample = samples.get(key + offset);
+        if (!sample) continue;
 
-        ids.forEach(id => used.add(id));
+        const delta = Math.abs(sample.t - time);
 
-        if (enabled("skeleton")) {
-          line(a, b, color);
-          line(b, c, color);
+        if (delta < distance && delta <= tolerance) {
+          best = sample;
+          distance = delta;
+        }
+      }
+
+      return best;
+    }
+
+    function stopCameraClock() {
+      if (!cameraRunning) return;
+      cameraElapsed = currentTime();
+      cameraRunning = false;
+    }
+
+    function startCameraClock() {
+      if (cameraRunning) return;
+      cameraStartedAt = performance.now();
+      cameraRunning = true;
+    }
+
+    function pausePlayback() {
+      if (source === "camera") stopCameraClock();
+      video.pause();
+    }
+
+    function syncButtons() {
+      if (!active) return;
+
+      const busy = sourceBusy || saving || scanning;
+      const metadataLocked = busy || samples.size > 0;
+
+      for (const id of [
+        "#an-camera", "#an-switch", "#an-file",
+        "#an-save", "#an-report"
+      ]) {
+        $(id).disabled = busy;
+      }
+
+      for (const id of [
+        "#an-athlete", "#an-exercise", "#an-view",
+        "#an-weight", "#an-target"
+      ]) {
+        $(id).disabled = metadataLocked;
+      }
+
+      for (const id of [
+        "#an-back", "#an-next", "#an-seek", "#an-speed"
+      ]) {
+        $(id).disabled = busy || source !== "upload";
+      }
+
+      $("#an-play").disabled = busy || !source;
+      $("#an-scan").disabled = busy || source !== "upload";
+      $("#an-cancel").hidden = !scanning;
+      $("#an-edit").disabled = busy;
+      $("#an-snapshot").disabled = busy || !source;
+      $("#an-keep-media").disabled = busy || source !== "upload";
+
+      for (const id of [
+        "#an-range-start", "#an-range-end",
+        "#an-rep-key", "#an-low", "#an-high",
+        "#an-memo"
+      ]) {
+        $(id).disabled = busy;
+      }
+
+      $("#an-undo").disabled = busy || !history.length;
+      $("#an-redo").disabled = busy || !future.length;
+    }
+
+    async function getModel() {
+      if (model) return model;
+      if (modelPromise) return modelPromise;
+
+      status("자세 인식 모델을 불러오는 중입니다…");
+
+      modelPromise = (async () => {
+        const vision = await import(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/+esm"
+        );
+
+        const fileset = await vision.FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
+        );
+
+        const created = await vision.PoseLandmarker.createFromOptions(
+          fileset,
+          {
+            baseOptions: {
+              modelAssetPath:
+                "https://storage.googleapis.com/mediapipe-models/" +
+                "pose_landmarker/pose_landmarker_lite/float16/1/" +
+                "pose_landmarker_lite.task",
+              delegate: "CPU"
+            },
+            runningMode: "IMAGE",
+            numPoses: 1,
+            minPoseDetectionConfidence: 0.5,
+            minPosePresenceConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+            outputSegmentationMasks: false
+          }
+        );
+
+        if (!active) {
+          created.close();
+          throw new Error("분석 화면이 닫혔습니다.");
         }
 
-        const angle = sample.angles?.[side + "_" + joint];
+        model = created;
+        return created;
+      })();
 
-        if (
-          enabled("angles") &&
-          Number.isFinite(angle) &&
-          [a, b, c].every(CM.posePointValid)
-        ) {
-          const bx = b.x * canvas.width;
-          const by = b.y * canvas.height;
-
-          const start = Math.atan2(
-            (a.y - b.y) * canvas.height,
-            (a.x - b.x) * canvas.width
-          );
-
-          const end = Math.atan2(
-            (c.y - b.y) * canvas.height,
-            (c.x - b.x) * canvas.width
-          );
-
-          const delta = Math.atan2(
-            Math.sin(end - start),
-            Math.cos(end - start)
-          );
-
-          context.strokeStyle = color;
-          context.beginPath();
-
-          context.arc(
-            bx,
-            by,
-            Math.max(15, canvas.width / 45),
-            start,
-            start + delta,
-            delta < 0
-          );
-
-          context.stroke();
-
-          const label = angle.toFixed(1) + "°";
-          const textWidth = context.measureText(label).width;
-
-          context.fillStyle = "#06121ee6";
-
-          context.fillRect(
-            bx + 10,
-            by - 27,
-            textWidth + 12,
-            26
-          );
-
-          context.fillStyle = color;
-          context.fillText(label, bx + 16, by - 8);
-        }
+      try {
+        return await modelPromise;
+      } finally {
+        modelPromise = null;
       }
     }
 
-    if (enabled("points")) {
-      for (const id of used) {
+    function waitForVideo() {
+      return new Promise((resolve, reject) => {
+        if (video.readyState >= 2 && video.videoWidth > 0) {
+          resolve();
+          return;
+        }
+
+        const timer = setTimeout(() => {
+          finish(new Error("영상 준비 시간이 초과되었습니다."));
+        }, 15000);
+
+        function finish(error) {
+          clearTimeout(timer);
+          video.removeEventListener("loadeddata", ready);
+          video.removeEventListener("error", failed);
+          signal.removeEventListener("abort", aborted);
+
+          if (error) reject(error);
+          else resolve();
+        }
+
+        function ready() {
+          if (video.videoWidth > 0) finish();
+        }
+
+        function failed() {
+          finish(new Error(
+            "이 영상을 재생할 수 없습니다. 다른 형식의 영상을 사용해 주세요."
+          ));
+        }
+
+        function aborted() {
+          finish(new Error("분석 화면이 닫혔습니다."));
+        }
+
+        video.addEventListener("loadeddata", ready);
+        video.addEventListener("error", failed);
+        signal.addEventListener("abort", aborted, { once: true });
+      });
+    }
+
+    function resize() {
+      width = video.videoWidth || width;
+      height = video.videoHeight || height;
+
+      canvas.width = width;
+      canvas.height = height;
+      stage.style.aspectRatio = `${width} / ${height}`;
+    }
+
+    function releaseSource() {
+      pausePlayback();
+
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+
+      video.srcObject = null;
+      video.removeAttribute("src");
+      video.load();
+
+      if (objectURL) {
+        URL.revokeObjectURL(objectURL);
+        objectURL = null;
+      }
+    }
+
+    function clearMeasurement() {
+      samples.clear();
+      snapshots.length = 0;
+      manualRepetitions.length = 0;
+      history.length = 0;
+      future.length = 0;
+
+      savedId = null;
+      mediaId = null;
+      createdAt = null;
+      ghost = null;
+      markStart = null;
+      drag = null;
+
+      cameraElapsed = 0;
+      cameraRunning = false;
+      lastDetectionKey = null;
+      inferenceFailed = false;
+      dirty = false;
+
+      $("#an-edit").value = "none";
+      $("#an-ghost").checked = false;
+      $("#an-range-start").value = "0";
+      $("#an-range-end").value = "";
+      $("#an-mark-label").textContent = "수동 구간 시작점 없음";
+
+      renderSnapshots();
+      updateGraph(true);
+    }
+
+    function confirmSourceChange() {
+      if (sourceBusy || scanning || saving) return false;
+
+      if (dirty) {
+        return window.confirm(
+          "현재 측정에 저장하지 않은 변경 사항이 있습니다.\n\n" +
+          "새 영상이나 다른 카메라로 바꾸면 현재 측정이 초기화됩니다.\n" +
+          "저장하지 않고 새 측정을 시작할까요?"
+        );
+      }
+
+      if (samples.size || snapshots.length) {
+        return window.confirm(
+          "촬영 구도가 달라지므로 새 측정을 시작합니다.\n" +
+          "이미 저장한 기록은 유지됩니다. 계속할까요?"
+        );
+      }
+
+      return true;
+    }
+
+    async function connectCamera(requestedFacing = facing) {
+      if (!confirmSourceChange()) return;
+
+      if (!window.isSecureContext) {
+        throw new Error(
+          "카메라는 HTTPS 주소 또는 localhost에서 사용할 수 있습니다."
+        );
+      }
+
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("이 브라우저에서 카메라 API를 사용할 수 없습니다.");
+      }
+
+      sourceBusy = true;
+      syncButtons();
+
+      try {
+        // 모델 준비에 실패해도 기존 측정은 남겨 둡니다.
+        await getModel();
+        if (!active) return;
+
+        releaseSource();
+        clearMeasurement();
+
+        source = null;
+        sourceFile = null;
+        sourceName = "";
+
+        status(
+          requestedFacing === "user"
+            ? "전면 카메라를 연결하는 중입니다…"
+            : "후면 카메라를 연결하는 중입니다…"
+        );
+
+        const acquired = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { ideal: requestedFacing },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        });
+
+        if (!active) {
+          acquired.getTracks().forEach(track => track.stop());
+          return;
+        }
+
+        stream = acquired;
+
+        const track = stream.getVideoTracks()[0];
+        const actualFacing = track.getSettings?.().facingMode;
+
+        facing = actualFacing === "user" ||
+          actualFacing === "environment"
+          ? actualFacing
+          : requestedFacing;
+
+        video.srcObject = stream;
+        await video.play();
+        await waitForVideo();
+
+        if (!active) return;
+
+        source = "camera";
+        sourceName = track.label || "카메라";
+        resize();
+        startCameraClock();
+
+        $("#an-placeholder").hidden = true;
+        $("#an-placeholder").style.display = "none";
+
+        $("#an-camera-label").textContent =
+          `연결 카메라: ${
+            actualFacing === "user"
+              ? "전면"
+              : actualFacing === "environment"
+                ? "후면"
+                : "방향 확인 불가"
+          }${track.label ? ` · ${track.label}` : ""}`;
+
+        $("#an-switch").textContent =
+          facing === "user"
+            ? "후면 카메라로 전환"
+            : "전면 카메라로 전환";
+
+        status(
+          "카메라 분석 중 · 전면 화면도 좌우 반전 없이 표시합니다."
+        );
+      } catch (error) {
+        if (stream) {
+          stream.getTracks().forEach(track => track.stop());
+          stream = null;
+        }
+        source = null;
+        throw error;
+      } finally {
+        sourceBusy = false;
+        syncButtons();
+      }
+    }
+
+    async function uploadFile(file) {
+      if (!file || !confirmSourceChange()) return;
+
+      sourceBusy = true;
+      syncButtons();
+
+      try {
+        await getModel();
+        if (!active) return;
+
+        releaseSource();
+        clearMeasurement();
+
+        source = null;
+        sourceFile = file;
+        sourceName = file.name;
+
+        objectURL = URL.createObjectURL(file);
+        video.src = objectURL;
+        video.load();
+
+        await waitForVideo();
+        if (!active) return;
+
+        source = "upload";
+        resize();
+
+        $("#an-placeholder").hidden = true;
+        $("#an-placeholder").style.display = "none";
+
+        if (finite(video.duration)) {
+          $("#an-seek").max = String(video.duration);
+          $("#an-range-end").value = video.duration.toFixed(1);
+        }
+
+        status(`영상 준비 완료 · ${file.name}`);
+
+        detectFrame(true);
+        draw();
+        updateGraph(true);
+      } finally {
+        sourceBusy = false;
+        syncButtons();
+      }
+    }
+
+    function detectFrame(force = false) {
+      if (
+        !active || !model || !source ||
+        video.readyState < 2 || inferenceFailed
+      ) {
+        return;
+      }
+
+      const t = currentTime();
+      const key = keyOf(t);
+
+      if (!force && key === lastDetectionKey) return;
+
+      lastDetectionKey = key;
+
+      const previous = samples.get(key);
+
+      // 이미 분석한 영상 프레임과 수동 수정값은 유지합니다.
+      if (previous && source === "upload") return;
+
+      const result = model.detect(video);
+      const raw = result.landmarks?.[0] || [];
+
+      const points = Array.from({ length: 33 }, (_, index) => {
+        const point = raw[index];
+
+        return point
+          ? {
+              x: point.x,
+              y: point.y,
+              z: point.z,
+              visibility: finite(point.visibility)
+                ? point.visibility
+                : 0
+            }
+          : null;
+      });
+
+      const measured = CM.measurePose(points, width, height);
+
+      samples.set(key, {
+        t,
+        points,
+        angles: measured.angles,
+        metrics: measured.metrics,
+        manual: false,
+        bar: previous?.bar || null
+      });
+
+      dirty = true;
+
+      if (samples.size === 1) syncButtons();
+    }
+
+    function shownSides() {
+      const value = $("#an-side").value;
+      return value === "both" ? ["left", "right"] : [value];
+    }
+
+    function shownJoints() {
+      return [...main.querySelectorAll("[data-joint]:checked")]
+        .map(node => node.dataset.joint);
+    }
+
+    function pointVisible(index) {
+      const selected = $("#an-side").value;
+
+      if (selected === "both") return true;
+      return selected === "left"
+        ? leftPoints.has(index)
+        : rightPoints.has(index);
+    }
+
+    function drawSkeleton(points, ghostMode = false) {
+      const scale = Math.max(1, width / 800);
+
+      context.lineWidth = 2.5 * scale;
+      context.lineCap = "round";
+
+      for (const [a, b] of connections) {
+        if (!pointVisible(a) || !pointVisible(b)) continue;
+        if (
+          !CM.posePointValid(points[a]) ||
+          !CM.posePointValid(points[b])
+        ) continue;
+
+        context.strokeStyle = ghostMode
+          ? "rgba(255,255,255,.35)"
+          : leftPoints.has(a) ? "#50daf2" : "#f58cce";
+
+        context.beginPath();
+        context.moveTo(points[a].x * width, points[a].y * height);
+        context.lineTo(points[b].x * width, points[b].y * height);
+        context.stroke();
+      }
+
+      for (const [idText] of Object.entries(CM.posePointNames)) {
+        const id = Number(idText);
         const point = points[id];
 
-        if (!CM.posePointValid(point)) continue;
+        if (!pointVisible(id) || !CM.posePointValid(point)) continue;
+
+        context.fillStyle = ghostMode
+          ? "rgba(255,255,255,.4)"
+          : point.manual
+            ? "#f5d76e"
+            : leftPoints.has(id) ? "#50daf2" : "#f58cce";
 
         context.beginPath();
         context.arc(
-          point.x * canvas.width,
-          point.y * canvas.height,
-          Math.max(3, canvas.width / 240),
+          point.x * width,
+          point.y * height,
+          3.5 * scale,
           0,
           Math.PI * 2
         );
-
-        context.fillStyle = point.manual
-          ? "#e5c87b"
-          : "#eafaff";
-
         context.fill();
       }
     }
 
-    context.restore();
-  }
+    function draw() {
+      if (!active) return;
 
-  function draw() {
-    if (!state.active || !context) return;
+      context.clearRect(0, 0, width, height);
 
-    context.clearRect(0, 0, canvas.width, canvas.height);
+      if (!source) return;
 
-    context.lineWidth = Math.max(2, canvas.width / 400);
-    context.font =
-      Math.max(14, canvas.width / 65) + "px sans-serif";
+      const scale = Math.max(1, width / 800);
+      const time = currentTime();
+      const sample = nearestSample(time);
 
-    if (enabled("guides")) {
-      const floor = Number($("an-floor").value) / 100;
-      const tilt =
-        Number($("an-floor-angle").value) * Math.PI / 180;
+      if ($("#an-guides").checked) {
+        const floor = clamp(
+          Number($("#an-floor").value) || 0,
+          0,
+          100
+        ) / 100;
 
-      const midY = floor * canvas.height;
-      const offset = Math.tan(tilt) * canvas.width / 2;
+        context.save();
+        context.strokeStyle = "rgba(255,255,255,.4)";
+        context.lineWidth = scale;
+        context.setLineDash([7 * scale, 5 * scale]);
+        context.beginPath();
+        context.moveTo(width / 2, 0);
+        context.lineTo(width / 2, height);
+        context.moveTo(0, floor * height);
+        context.lineTo(width, floor * height);
+        context.stroke();
+        context.restore();
+      }
 
-      context.strokeStyle = "#50daf280";
-      context.setLineDash([8, 8]);
-      context.beginPath();
+      if ($("#an-ghost").checked && ghost) {
+        drawSkeleton(ghost, true);
+      }
 
-      context.moveTo(0, midY - offset);
-      context.lineTo(canvas.width, midY + offset);
-
-      context.moveTo(canvas.width / 2, 0);
-      context.lineTo(canvas.width / 2, canvas.height);
-
-      context.stroke();
-      context.setLineDash([]);
-    }
-
-    if (enabled("trail")) {
-      const recent = samplesArray().filter(sample => {
-        return (
-          sample.t <= timeNow() &&
-          sample.t >= timeNow() - 3
+      if ($("#an-trails").checked) {
+        const trailSamples = sortedSamples().filter(item =>
+          item.t >= time - 3 && item.t <= time
         );
-      });
 
-      for (const side of selectedSides()) {
-        for (const joint of selectedJoints()) {
-          const id = CM.poseJoints[joint][side][1];
+        for (const side of shownSides()) {
+          const pointId = side === "left" ? 15 : 16;
+
+          context.strokeStyle =
+            side === "left" ? "#50daf2" : "#f58cce";
+          context.lineWidth = 2 * scale;
+          context.beginPath();
 
           let previous = null;
 
-          for (const sample of recent) {
-            const point = sample.points?.[id];
+          for (const item of trailSamples) {
+            const point = item.points?.[pointId];
 
-            if (
-              previous &&
-              sample.t - previous.t <= 0.8
-            ) {
-              line(
-                previous.point,
-                point,
-                side === "left" ? "#50daf270" : "#e691c070"
-              );
+            if (!CM.posePointValid(point)) {
+              previous = null;
+              continue;
             }
 
-            previous = CM.posePointValid(point)
-              ? { point, t: sample.t }
-              : null;
+            const x = point.x * width;
+            const y = point.y * height;
+
+            if (!previous || item.t - previous.t > 0.8) {
+              context.moveTo(x, y);
+            } else {
+              context.lineTo(x, y);
+            }
+
+            previous = item;
+          }
+
+          context.stroke();
+        }
+
+        context.strokeStyle = "#f5d76e";
+        context.beginPath();
+        let previousBar = null;
+
+        for (const item of trailSamples) {
+          const point = item.bar;
+
+          if (!point || !finite(point.x) || !finite(point.y)) {
+            previousBar = null;
+            continue;
+          }
+
+          if (!previousBar || item.t - previousBar.t > 0.8) {
+            context.moveTo(point.x * width, point.y * height);
+          } else {
+            context.lineTo(point.x * width, point.y * height);
+          }
+
+          previousBar = item;
+        }
+
+        context.stroke();
+      }
+
+      if (!sample) return;
+
+      if ($("#an-skeleton").checked) {
+        drawSkeleton(sample.points || []);
+      }
+
+      if ($("#an-angles").checked) {
+        context.font = `bold ${14 * scale}px sans-serif`;
+        context.textBaseline = "middle";
+
+        for (const joint of shownJoints()) {
+          for (const side of shownSides()) {
+            const value = sample.angles?.[`${side}_${joint}`];
+            const pointId = CM.poseJoints[joint][side][1];
+            const point = sample.points?.[pointId];
+
+            if (!finite(value) || !CM.posePointValid(point)) continue;
+
+            const text = `${value.toFixed(0)}°`;
+            const textWidth = context.measureText(text).width;
+            const x = clamp(
+              point.x * width + 8 * scale,
+              0,
+              Math.max(0, width - textWidth - 10 * scale)
+            );
+            const y = clamp(
+              point.y * height,
+              12 * scale,
+              height - 12 * scale
+            );
+
+            context.fillStyle = "rgba(0,0,0,.7)";
+            context.fillRect(
+              x - 3 * scale,
+              y - 10 * scale,
+              textWidth + 6 * scale,
+              20 * scale
+            );
+
+            context.fillStyle =
+              side === "left" ? "#50daf2" : "#f58cce";
+            context.fillText(text, x, y);
           }
         }
       }
 
-      const bars = recent.filter(sample => sample.bar);
-
-      for (let index = 1; index < bars.length; index += 1) {
-        line(
-          { ...bars[index - 1].bar, manual: true },
-          { ...bars[index].bar, manual: true },
-          "#e5c87b"
+      if (sample.bar) {
+        context.strokeStyle = "#f5d76e";
+        context.lineWidth = 2 * scale;
+        context.beginPath();
+        context.arc(
+          sample.bar.x * width,
+          sample.bar.y * height,
+          7 * scale,
+          0,
+          Math.PI * 2
         );
+        context.stroke();
       }
     }
 
-    if (enabled("ghost")) {
-      drawPose(state.reference, 0.28);
+    function repetitionConfig() {
+      return {
+        key: $("#an-rep-key").value,
+        low: Number($("#an-low").value),
+        high: Number($("#an-high").value),
+        minDuration: 0.5,
+        maxGap: 0.8
+      };
     }
 
-    const sample = currentSample() || state.current;
-
-    drawPose(sample);
-
-    if (sample?.bar) {
-      context.fillStyle = "#e5c87b";
-      context.beginPath();
-
-      context.arc(
-        sample.bar.x * canvas.width,
-        sample.bar.y * canvas.height,
-        7,
-        0,
-        Math.PI * 2
-      );
-
-      context.fill();
-    }
-  }
-
-  function drawGraph(force = false) {
-    if (!state.active) return;
-
-    if (!force && performance.now() - state.lastGraphAt < 600) {
-      return;
-    }
-
-    state.lastGraphAt = performance.now();
-
-    const samples = samplesArray();
-
-    const series = [];
-
-    for (const joint of selectedJoints()) {
-      for (const side of selectedSides()) {
-        const key = side + "_" + joint;
-
-        series.push({
-          name:
-            (side === "left" ? "왼쪽 " : "오른쪽 ") +
-            CM.poseJoints[joint].name,
-
-          color: CM.colors[
-            Object.keys(CM.poseJoints).indexOf(joint) %
-            CM.colors.length
-          ],
-
-          dash: side === "right",
-
-          data: samples.map(sample => ({
-            x: sample.t,
-            y: sample.angles?.[key] ?? null
-          }))
-        });
-      }
-    }
-
-    $("an-chart").innerHTML = CM.lineChart(series, {
-      min: 0,
-      max: 180,
-      unit: "°",
-      currentTime: timeNow()
-    });
-
-    const current = currentSample() || state.current;
-
-    $("an-metrics").innerHTML = series.map(item => {
-      const side = item.name.startsWith("왼쪽")
-        ? "left"
-        : "right";
-
-      const joint = selectedJoints().find(key => {
-        return item.name.endsWith(CM.poseJoints[key].name);
-      });
-
-      const value = current?.angles?.[side + "_" + joint];
-
-      return `
-        <div>
-          <small>${CM.escape(item.name)}</small>
-          <div class="metric">
-            ${CM.fmt(value)}<small>°</small>
-          </div>
-        </div>
-      `;
-    }).join("");
-
-    $("an-count").textContent =
-      "측정 " + samples.length + "개";
-  }
-
-  function repeatConfig() {
-    return {
-      key: $("an-rep-key").value,
-      low: Number($("an-low").value),
-      high: Number($("an-high").value)
-    };
-  }
-
-  function getRepetitions() {
-    if (state.manualReps.length) {
-      return [...state.manualReps]
-        .sort((a, b) => a.start - b.start);
-    }
-
-    if (exercise().mode !== "reps") {
-      return [];
-    }
-
-    return CM.detectRepetitions(
-      samplesArray(),
-      repeatConfig()
-    );
-  }
-
-  function drawRepetitions() {
-    const reps = getRepetitions();
-
-    $("an-repetitions").innerHTML = `
-      <p>
-        <strong>${reps.length}회</strong>
-        ·
-        ${
-          state.manualReps.length
-            ? "수동 지정 구간"
-            : exercise().mode === "reps"
-              ? "설정형 자동 인식 · 확인 필요"
-              : "수동 구간 지정 또는 유지시간 분석"
-        }
-      </p>
-
-      ${
-        reps.length
-          ? CM.barChart(
-              reps.map((rep, index) => ({
-                label: (index + 1) + "회",
-                value: rep.end - rep.start
-              })),
-              "초"
-            )
-          : ""
-      }
-    `;
-  }
-
-  function refresh() {
-    draw();
-    drawGraph(true);
-    drawRepetitions();
-  }
-
-  function guide() {
-    const side = $("an-view").value === "side";
-
-    $("an-guide").textContent = side
-      ? "측면: 전신과 발이 보이도록 고정 촬영하세요. 카메라에 가까운 쪽 관절을 선택하세요."
-      : "정면·후면: 어깨·골반·무릎·발이 보이도록 촬영하세요. 굽힘 각도는 측면과 직접 비교하지 마세요.";
-
-    $("an-rep-key").value =
-      "left_" + exercise().metric;
-  }
-
-  async function loadModel() {
-    if (state.model) return state.model;
-    if (state.modelLoading) return state.modelLoading;
-
-    status("관절 인식 모델을 불러오는 중입니다.");
-
-    state.modelLoading = (async function () {
-      const vision = await import(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/+esm"
-      );
-
-      const files = await vision.FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
-      );
-
-      const model = await vision.PoseLandmarker.createFromOptions(
-        files,
-        {
-          baseOptions: {
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-
-            delegate: "CPU"
-          },
-
-          runningMode: "IMAGE",
-          numPoses: 1,
-          minPoseDetectionConfidence: 0.6,
-          minPosePresenceConfidence: 0.6,
-          outputSegmentationMasks: false
-        }
-      );
-
-      if (!state.active) {
-        model.close();
-        throw new Error("분석 화면이 종료되었습니다.");
+    function repetitions() {
+      if (manualRepetitions.length) {
+        return manualRepetitions.slice().sort((a, b) => a.start - b.start);
       }
 
-      state.model = model;
+      if (exercise().mode !== "reps") return [];
 
-      status("자동 인식 준비 완료. 영상 재생 또는 전체 분석을 시작하세요.");
-
-      return model;
-    })();
-
-    try {
-      return await state.modelLoading;
-    } finally {
-      state.modelLoading = null;
-    }
-  }
-
-  function inferCurrentFrame() {
-    if (
-      !state.model ||
-      video.readyState < 2 ||
-      !video.videoWidth
-    ) {
-      return;
-    }
-
-    const key = timeKey(timeNow());
-    const old = state.samples.get(key);
-
-    const result = state.model.detect(video);
-
-    const detected = result.landmarks?.[0] || [];
-
-    const points = Array.from({ length: 33 }, (_, index) => {
-      if (old?.points?.[index]?.manual) {
-        return { ...old.points[index] };
-      }
-
-      const point = detected[index];
-
-      return point
-        ? {
-            x: point.x,
-            y: point.y,
-            visibility: point.visibility ?? 0
-          }
-        : null;
-    });
-
-    putSample(buildSample(timeNow(), points, old));
-
-    return detected.length > 0;
-  }
-
-  function stopCamera() {
-    if (state.stream) {
-      state.stream.getTracks().forEach(track => track.stop());
-      state.stream = null;
-    }
-
-    if (video.srcObject) {
-      video.pause();
-      video.srcObject = null;
-    }
-  }
-
-  function clearMeasurements() {
-    state.samples.clear();
-    state.current = null;
-    state.reference = null;
-    state.snapshots = [];
-    state.manualReps = [];
-    state.undo = [];
-    state.redo = [];
-    state.savedId = null;
-    state.a = null;
-    state.b = null;
-    state.lastTimeKey = null;
-
-    $("an-memo").value = "";
-    $("an-range").textContent = "A — / B —";
-    $("an-loop").checked = false;
-    $("an-snapshots").innerHTML = "";
-
-    state.revision = 0;
-    state.savedRevision = 0;
-
-    refresh();
-  }
-
-  function canReplaceSource() {
-    if (state.scanning || state.saving) {
-      CM.toast("진행 중인 작업이 끝난 뒤 변경해 주세요.");
-      return false;
-    }
-
-    if (state.revision !== state.savedRevision) {
-      return window.confirm(
-        "저장하지 않은 분석 내용이 있습니다. 새 영상으로 바꿀까요?"
+      return CM.detectRepetitions(
+        sortedSamples(),
+        repetitionConfig()
       );
     }
 
-    return true;
-  }
+    function updateGraph(force = false) {
+      if (!active) return;
 
-  async function connectCamera() {
-    if (!canReplaceSource()) return;
+      const now = performance.now();
+      if (!force && now - lastGraphAt < 650) return;
+      lastGraphAt = now;
 
-    if (
-      !window.isSecureContext ||
-      !navigator.mediaDevices?.getUserMedia
-    ) {
-      throw new Error(
-        "카메라는 HTTPS 또는 localhost에서 사용할 수 있습니다."
-      );
-    }
+      const all = sortedSamples();
+      const recent = source === "camera"
+        ? all.filter(sample => sample.t >= currentTime() - 30)
+        : all;
 
-    stopCamera();
+      const series = [];
+      const palette = ["#50daf2", "#f58cce", "#f5d76e", "#8ce5ac", "#b8a1ff"];
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: {
-          ideal: $("an-facing").value
-        },
-
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
-      },
-
-      audio: false
-    });
-
-    if (!state.active) {
-      stream.getTracks().forEach(track => track.stop());
-      return;
-    }
-
-    clearMeasurements();
-
-    if (state.fileUrl) {
-      URL.revokeObjectURL(state.fileUrl);
-      state.fileUrl = null;
-    }
-
-    state.file = null;
-    state.stream = stream;
-
-    video.removeAttribute("src");
-    video.srcObject = stream;
-
-    $("an-seek").disabled = true;
-
-    await video.play();
-
-    status("카메라 연결 완료. 자동 관절 인식을 준비해 주세요.");
-  }
-
-  function seekTo(time) {
-    if (state.stream || !Number.isFinite(video.duration)) {
-      return Promise.resolve();
-    }
-
-    const target = CM.clamp(
-      time,
-      0,
-      Math.max(0, video.duration - 0.001)
-    );
-
-    if (
-      Math.abs(video.currentTime - target) < 0.001 &&
-      video.readyState >= 2
-    ) {
-      return Promise.resolve();
-    }
-
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        clean();
-        reject(new Error("영상 시점 이동 시간이 초과되었습니다."));
-      }, 8000);
-
-      function clean() {
-        clearTimeout(timer);
-        video.removeEventListener("seeked", onSeek);
-        video.removeEventListener("error", onError);
-      }
-
-      function onSeek() {
-        clean();
-        resolve();
-      }
-
-      function onError() {
-        clean();
-        reject(new Error("영상을 읽지 못했습니다."));
-      }
-
-      video.addEventListener("seeked", onSeek, { once: true });
-      video.addEventListener("error", onError, { once: true });
-
-      video.currentTime = target;
-    });
-  }
-
-  async function scanVideo() {
-    if (state.scanning) return;
-
-    if (
-      state.stream ||
-      !state.file ||
-      !Number.isFinite(video.duration)
-    ) {
-      throw new Error("전체 분석은 업로드한 영상에서 사용하세요.");
-    }
-
-    if (video.duration > 600) {
-      throw new Error(
-        "이번 버전은 10분 이하 영상으로 분석해 주세요."
-      );
-    }
-
-    await loadModel();
-
-    state.scanning = true;
-    state.cancelScan = false;
-
-    $("an-cancel-scan").disabled = false;
-    $("an-scan").disabled = true;
-
-    video.pause();
-
-    const oldTime = timeNow();
-    const count = Math.floor(video.duration * 10);
-
-    try {
-      for (let index = 0; index <= count; index += 1) {
-        if (
-          state.cancelScan ||
-          !state.active
-        ) {
-          break;
-        }
-
-        await seekTo(index / 10);
-
-        if (!state.active || state.cancelScan) break;
-
-        inferCurrentFrame();
-
-        if (index % 5 === 0) {
-          status(
-            "전체 영상 분석 " +
-            Math.round(index / Math.max(1, count) * 100) +
-            "%"
-          );
-
-          draw();
-          drawGraph();
-
-          await new Promise(resolve => {
-            setTimeout(resolve, 0);
+      shownJoints().forEach((joint, index) => {
+        for (const side of shownSides()) {
+          series.push({
+            name: `${side === "left" ? "왼" : "오른"} ${jointNames[joint]}`,
+            color: palette[index % palette.length],
+            dash: side === "right" ? "6 4" : undefined,
+            data: recent.map(sample => ({
+              x: sample.t,
+              y: sample.angles?.[`${side}_${joint}`] ?? null
+            }))
           });
         }
-      }
-
-      if (state.active) {
-        status(
-          state.cancelScan
-            ? "분석 중지. 완료된 구간은 유지됩니다."
-            : "전체 분석 완료. 반복 구간과 관절점을 확인하세요."
-        );
-      }
-    } finally {
-      state.scanning = false;
-
-      if (state.active) {
-        $("an-cancel-scan").disabled = true;
-        $("an-scan").disabled = false;
-
-        await seekTo(oldTime);
-        state.current = currentSample();
-
-        refresh();
-      }
-    }
-  }
-
-  function loop() {
-    if (!state.active) return;
-
-    state.frameId = requestAnimationFrame(loop);
-
-    if (!video.videoWidth) return;
-
-    const key = timeKey(timeNow());
-
-    $("an-time").textContent =
-      CM.fmt(timeNow()) + "s";
-
-    if (!state.stream) {
-      $("an-seek").value = String(timeNow());
-    }
-
-    if (
-      !state.scanning &&
-      $("an-loop").checked &&
-      !state.stream &&
-      state.a !== null &&
-      state.b !== null &&
-      state.b > state.a &&
-      timeNow() >= state.b
-    ) {
-      video.currentTime = state.a;
-      return;
-    }
-
-    if (state.scanning || key === state.lastTimeKey) {
-      return;
-    }
-
-    state.lastTimeKey = key;
-
-    if (
-      state.model &&
-      !video.paused &&
-      !state.samples.has(key)
-    ) {
-      try {
-        inferCurrentFrame();
-      } catch (error) {
-        video.pause();
-        status("자동 인식 오류: " + error.message);
-      }
-    }
-
-    state.current = currentSample();
-
-    draw();
-    drawGraph();
-  }
-
-  /* -------------------------------------------------------
-     수동 편집과 되돌리기
-     ------------------------------------------------------- */
-
-  function clone(value) {
-    return value ? JSON.parse(JSON.stringify(value)) : null;
-  }
-
-  function saveHistory(key, before, after) {
-    state.undo.push({
-      key,
-      before: clone(before),
-      after: clone(after)
-    });
-
-    if (state.undo.length > 40) {
-      state.undo.shift();
-    }
-
-    state.redo = [];
-  }
-
-  function applyPointer(event) {
-    const rect = canvas.getBoundingClientRect();
-
-    const position = {
-      x: CM.clamp(
-        (event.clientX - rect.left) / rect.width,
-        0,
-        1
-      ),
-
-      y: CM.clamp(
-        (event.clientY - rect.top) / rect.height,
-        0,
-        1
-      )
-    };
-
-    const time = state.dragTime;
-    const key = timeKey(time);
-
-    const old = state.samples.get(key);
-
-    const points = old?.points
-      ? clone(old.points)
-      : Array(33).fill(null);
-
-    let sample;
-
-    if ($("an-tool").value === "bar") {
-      sample = buildSample(time, points, old);
-      sample.bar = position;
-      sample.manual = true;
-    } else {
-      const id = Number($("an-edit-point").value);
-
-      points[id] = {
-        ...position,
-        visibility: 1,
-        manual: true
-      };
-
-      sample = buildSample(time, points, old);
-    }
-
-    putSample(sample);
-    draw();
-  }
-
-  canvas.onpointerdown = function (event) {
-    if (
-      $("an-tool").value === "view" ||
-      state.scanning ||
-      !video.videoWidth
-    ) {
-      return;
-    }
-
-    if (state.stream) {
-      CM.toast("수동 보정은 업로드 영상에서 사용하세요.");
-      return;
-    }
-
-    video.pause();
-
-    state.dragTime = timeNow();
-    state.dragBefore = clone(currentSample());
-
-    canvas.setPointerCapture(event.pointerId);
-
-    applyPointer(event);
-  };
-
-  canvas.onpointermove = function (event) {
-    if (state.dragTime === null) return;
-    applyPointer(event);
-  };
-
-  function finishDrag(event) {
-    if (state.dragTime === null) return;
-
-    const key = timeKey(state.dragTime);
-
-    saveHistory(
-      key,
-      state.dragBefore,
-      state.samples.get(key)
-    );
-
-    state.dragTime = null;
-    state.dragBefore = null;
-
-    if (canvas.hasPointerCapture(event.pointerId)) {
-      canvas.releasePointerCapture(event.pointerId);
-    }
-
-    refresh();
-  }
-
-  canvas.onpointerup = finishDrag;
-  canvas.onpointercancel = finishDrag;
-
-  function restoreHistory(direction) {
-    const source = direction === "undo"
-      ? state.undo
-      : state.redo;
-
-    const target = direction === "undo"
-      ? state.redo
-      : state.undo;
-
-    const item = source.pop();
-
-    if (!item) {
-      CM.toast("변경할 편집 기록이 없습니다.");
-      return;
-    }
-
-    const sample = direction === "undo"
-      ? item.before
-      : item.after;
-
-    if (sample) {
-      state.samples.set(item.key, clone(sample));
-    } else {
-      state.samples.delete(item.key);
-    }
-
-    target.push(item);
-
-    changed();
-
-    state.current = currentSample();
-
-    refresh();
-  }
-
-  /* -------------------------------------------------------
-     장면 캡처
-     ------------------------------------------------------- */
-
-  function captureSnapshot() {
-    if (!video.videoWidth || video.readyState < 2) {
-      throw new Error("저장할 영상 장면이 없습니다.");
-    }
-
-    if (state.snapshots.length >= 12) {
-      throw new Error("한 분석에 최대 12개 장면을 저장할 수 있습니다.");
-    }
-
-    draw();
-
-    const output = document.createElement("canvas");
-    const ratio = Math.min(1, 960 / video.videoWidth);
-
-    output.width = Math.round(video.videoWidth * ratio);
-    output.height = Math.round(video.videoHeight * ratio);
-
-    const ctx = output.getContext("2d");
-
-    ctx.drawImage(video, 0, 0, output.width, output.height);
-    ctx.drawImage(canvas, 0, 0, output.width, output.height);
-
-    state.snapshots.push({
-      id: CM.uid(),
-      t: timeNow(),
-      image: output.toDataURL("image/jpeg", 0.8)
-    });
-
-    changed();
-
-    drawSnapshots();
-  }
-
-  function drawSnapshots() {
-    $("an-snapshots").innerHTML =
-      state.snapshots.map(snapshot => `
-        <div class="snapshot-card">
-          <img
-            class="snapshot"
-            src="${snapshot.image}"
-            alt="${CM.fmt(snapshot.t)}초 분석 장면"
-          >
-
-          <div class="row spread">
-            <small>${CM.fmt(snapshot.t)}초</small>
-
-            <button
-              class="small"
-              data-remove-snapshot="${snapshot.id}"
-            >
-              삭제
-            </button>
-          </div>
+      });
+
+      $("#an-chart").innerHTML = CM.lineChart(series, {
+        unit: "°",
+        maxGap: 0.8,
+        currentTime: currentTime()
+      });
+
+      const current = nearestSample(currentTime());
+
+      $("#an-values").innerHTML = shownJoints().map(joint => `
+        <div class="metric">
+          <span class="muted">${jointNames[joint]}</span>
+          ${shownSides().map(side => {
+            const value = current?.angles?.[`${side}_${joint}`];
+            return `
+              <div style="margin-top:6px">
+                ${side === "left" ? "왼쪽" : "오른쪽"}
+                <strong>${finite(value) ? value.toFixed(1) + "°" : "—"}</strong>
+              </div>
+            `;
+          }).join("")}
         </div>
       `).join("");
-  }
 
-  /* -------------------------------------------------------
-     분석 저장
-     ------------------------------------------------------- */
+      const reps = repetitions();
+      const mode = manualRepetitions.length
+        ? "수동"
+        : exercise().mode === "reps" ? "자동·실험" : "수동 구간 사용";
 
-  async function saveAnalysis(openReport = false) {
-    if (state.saving || state.scanning) {
-      throw new Error("진행 중인 작업을 먼저 마쳐 주세요.");
+      $("#an-rep-count").textContent = `${reps.length}회 · ${mode}`;
+
+      $("#an-rep-list").innerHTML = reps.length
+        ? `
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>반복</th><th>시작</th><th>종료</th><th>시간</th></tr>
+              </thead>
+              <tbody>
+                ${reps.slice(-20).map((rep, index) => `
+                  <tr>
+                    <td>${Math.max(0, reps.length - 20) + index + 1}</td>
+                    <td>${rep.start.toFixed(2)}초</td>
+                    <td>${rep.end.toFixed(2)}초</td>
+                    <td>${(rep.end - rep.start).toFixed(2)}초</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        `
+        : CM.empty("감지하거나 직접 지정한 반복 구간이 없습니다.");
     }
 
-    const samples = samplesArray();
+    async function seekTo(time) {
+      if (source !== "upload") return;
 
-    if (!samples.length) {
-      throw new Error(
-        "자동 분석 또는 수동 기준점 지정 후 저장해 주세요."
-      );
-    }
+      const end = finite(video.duration) ? video.duration : time;
+      const target = clamp(time, 0, end);
 
-    const low = Number($("an-low").value);
-    const high = Number($("an-high").value);
-
-    if (exercise().mode === "reps" && low >= high) {
-      throw new Error("낮은 각도는 높은 각도보다 작아야 합니다.");
-    }
-
-    video.pause();
-
-    state.saving = true;
-
-    $("an-save").disabled = true;
-    $("an-report").disabled = true;
-
-    const revision = state.revision;
-    const id = state.savedId || CM.uid();
-
-    try {
-      const athleteId = $("an-athlete").value;
-
-      const athlete = athleteId
-        ? await CM.db.get("athletes", athleteId)
-        : null;
-
-      const existing = await CM.db.get("records", id);
-
-      let mediaId = existing?.mediaId || null;
-
-      if (state.file && $("an-keep-media").checked) {
-        mediaId = id;
-
-        await CM.db.put("media", {
-          id: mediaId,
-          name: state.file.name,
-          type: state.file.type,
-          blob: state.file
-        });
+      if (Math.abs(video.currentTime - target) < 0.001 &&
+          video.readyState >= 2) {
+        return;
       }
 
-      const record = {
-        ...existing,
-
-        id,
-
-        athleteId,
-        athleteName: athlete?.name || "임시 분석",
-
-        exercise: { ...exercise() },
-        exerciseId: exercise().id,
-
-        view: $("an-view").value,
-
-        weight: $("an-load").value === ""
-          ? null
-          : Number($("an-load").value),
-
-        targetReps: Number($("an-target").value) || null,
-
-        createdAt:
-          existing?.createdAt || new Date().toISOString(),
-
-        updatedAt: new Date().toISOString(),
-
-        width: state.width,
-        height: state.height,
-
-        source: state.file ? "upload" : "camera",
-
-        sourceName: state.file?.name || "실시간 카메라",
-
-        duration: state.file
-          ? video.duration
-          : samples[samples.length - 1].t - samples[0].t,
-
-        samples,
-
-        repetitions: getRepetitions(),
-
-        repetitionConfig: repeatConfig(),
-
-        repetitionSource: state.manualReps.length
-          ? "manual"
-          : exercise().mode === "reps"
-            ? "experimental-auto"
-            : "none",
-
-        range:
-          state.a !== null &&
-          state.b !== null &&
-          state.b > state.a
-            ? { start: state.a, end: state.b }
-            : null,
-
-        snapshots: clone(state.snapshots),
-
-        memo: $("an-memo").value.trim(),
-
-        coachFeedback: existing?.coachFeedback || "",
-
-        mediaId,
-
-        measurementVersion: "2d-v1",
-
-        angleDefinition: "three-point-internal-angle",
-
-        barTracking: "manual",
-
-        clinicalValidation: false
-      };
-
-      await CM.db.put("records", record);
-
-      state.savedId = id;
-      state.savedRevision = revision;
-
-      CM.selectedAthlete = athleteId;
-      CM.selectedRecord = id;
-
-      CM.toast("분석 기록을 저장했습니다.");
-
-      if (openReport) {
-        location.hash = "reports";
-      }
-    } finally {
-      state.saving = false;
-
-      if (state.active) {
-        $("an-save").disabled = false;
-        $("an-report").disabled = false;
-      }
-    }
-  }
-
-  /* -------------------------------------------------------
-     이벤트
-     ------------------------------------------------------- */
-
-  function safe(handler) {
-    return async function (event) {
-      try {
-        await handler(event);
-      } catch (error) {
-        status(error.message);
-        CM.toast(error.message || "작업을 완료하지 못했습니다.");
-      }
-    };
-  }
-
-  $("an-camera").onclick = safe(connectCamera);
-
-  $("an-camera-stop").onclick = function () {
-    stopCamera();
-    status("카메라를 종료했습니다. 측정 기록은 유지됩니다.");
-  };
-
-  $("an-model").onclick = safe(async function () {
-    await loadModel();
-
-    if (video.readyState >= 2) {
-      inferCurrentFrame();
-      refresh();
-    }
-  });
-
-  $("an-file").onchange = safe(async function () {
-    const file = $("an-file").files?.[0];
-
-    if (!file) return;
-
-    if (!canReplaceSource()) {
-      $("an-file").value = "";
-      return;
-    }
-
-    stopCamera();
-    video.pause();
-
-    clearMeasurements();
-
-    if (state.fileUrl) {
-      URL.revokeObjectURL(state.fileUrl);
-    }
-
-    state.file = file;
-    state.fileUrl = URL.createObjectURL(file);
-
-    video.srcObject = null;
-    video.src = state.fileUrl;
-    video.load();
-
-    status(
-      "영상 준비 중. 지원되지 않는 형식이면 MP4(H.264)로 변환해 주세요."
-    );
-  });
-
-  video.onloadedmetadata = function () {
-    resizeStage();
-    status("영상 준비 완료.");
-  };
-
-  video.onloadeddata = function () {
-    resizeStage();
-    draw();
-  };
-
-  video.onerror = function () {
-    status(
-      "영상 재생에 실패했습니다. 파일 형식과 손상 여부를 확인하세요."
-    );
-  };
-
-  video.onseeked = function () {
-    state.current = currentSample();
-    state.lastTimeKey = null;
-
-    if (!state.scanning) {
-      draw();
-      drawGraph(true);
-    }
-  };
-
-  $("an-play").onclick = safe(async function () {
-    if (state.scanning) return;
-
-    if (video.readyState < 2) {
-      throw new Error("영상을 먼저 연결해 주세요.");
-    }
-
-    if (video.paused) {
-      await video.play();
-    } else {
-      video.pause();
-      refresh();
-    }
-  });
-
-  $("an-speed").onchange = function () {
-    video.playbackRate = Number($("an-speed").value);
-  };
-
-  $("an-back").onclick = safe(async function () {
-    if (state.scanning) return;
-    video.pause();
-    await seekTo(timeNow() - 0.1);
-  });
-
-  $("an-forward").onclick = safe(async function () {
-    if (state.scanning) return;
-    video.pause();
-    await seekTo(timeNow() + 0.1);
-  });
-
-  $("an-seek").oninput = safe(async function () {
-    if (state.scanning) return;
-    video.pause();
-    await seekTo(Number($("an-seek").value));
-  });
-
-  $("an-scan").onclick = safe(scanVideo);
-
-  $("an-cancel-scan").onclick = function () {
-    state.cancelScan = true;
-  };
-
-  main.querySelectorAll(
-    "[data-overlay], [data-joint]"
-  ).forEach(input => {
-    input.onchange = refresh;
-  });
-
-  $("an-side").onchange = refresh;
-
-  $("an-all-joints").onclick = function () {
-    main.querySelectorAll("[data-joint]").forEach(input => {
-      input.checked = true;
-    });
-
-    refresh();
-  };
-
-  $("an-no-joints").onclick = function () {
-    main.querySelectorAll("[data-joint]").forEach(input => {
-      input.checked = false;
-    });
-
-    refresh();
-  };
-
-  $("an-reference").onclick = function () {
-    const sample = currentSample() || state.current;
-
-    if (!sample) {
-      CM.toast("먼저 관절점을 인식하거나 수동 지정하세요.");
-      return;
-    }
-
-    state.reference = clone(sample);
-
-    main.querySelector(
-      '[data-overlay="ghost"]'
-    ).checked = true;
-
-    draw();
-
-    CM.toast("현재 관절 위치를 기준 자세로 설정했습니다.");
-  };
-
-  $("an-snapshot").onclick = safe(captureSnapshot);
-
-  $("an-snapshots").onclick = function (event) {
-    const button = event.target.closest(
-      "[data-remove-snapshot]"
-    );
-
-    if (!button) return;
-
-    state.snapshots = state.snapshots.filter(snapshot => {
-      return snapshot.id !== button.dataset.removeSnapshot;
-    });
-
-    changed();
-    drawSnapshots();
-  };
-
-  $("an-undo").onclick = function () {
-    restoreHistory("undo");
-  };
-
-  $("an-redo").onclick = function () {
-    restoreHistory("redo");
-  };
-
-  $("an-floor").oninput = draw;
-  $("an-floor-angle").oninput = draw;
-
-  function updateRange() {
-    $("an-range").textContent =
-      "A " + CM.fmt(state.a) + "초 / " +
-      "B " + CM.fmt(state.b) + "초";
-
-    changed();
-  }
-
-  $("an-mark-a").onclick = function () {
-    state.a = timeNow();
-    updateRange();
-  };
-
-  $("an-mark-b").onclick = function () {
-    state.b = timeNow();
-    updateRange();
-  };
-
-  $("an-add-rep").onclick = function () {
-    if (
-      state.a === null ||
-      state.b === null ||
-      state.b <= state.a
-    ) {
-      CM.toast("시작 A보다 뒤에 종료 B를 지정하세요.");
-      return;
-    }
-
-    const overlap = state.manualReps.some(rep => {
-      return state.a < rep.end && state.b > rep.start;
-    });
-
-    if (overlap) {
-      CM.toast("기존 수동 반복과 구간이 겹칩니다.");
-      return;
-    }
-
-    state.manualReps.push({
-      id: CM.uid(),
-      start: state.a,
-      end: state.b,
-      duration: state.b - state.a,
-      source: "manual"
-    });
-
-    changed();
-    drawRepetitions();
-  };
-
-  $("an-clear-reps").onclick = function () {
-    if (!state.manualReps.length) return;
-
-    if (!window.confirm("수동 반복 구간을 초기화할까요?")) {
-      return;
-    }
-
-    state.manualReps = [];
-
-    changed();
-    drawRepetitions();
-  };
-
-  $("an-recount").onclick = function () {
-    const config = repeatConfig();
-
-    if (config.low >= config.high) {
-      CM.toast("낮은 각도는 높은 각도보다 작아야 합니다.");
-      return;
-    }
-
-    changed();
-    drawRepetitions();
-  };
-
-  $("an-exercise").onchange = function () {
-    CM.selectedExercise = $("an-exercise").value;
-
-    guide();
-    changed();
-    drawRepetitions();
-  };
-
-  $("an-view").onchange = function () {
-    guide();
-    changed();
-  };
-
-  for (const id of [
-    "an-athlete",
-    "an-load",
-    "an-target",
-    "an-memo",
-    "an-low",
-    "an-high",
-    "an-rep-key",
-    "an-keep-media"
-  ]) {
-    $(id).addEventListener("change", changed);
-  }
-
-  $("an-save").onclick = safe(function () {
-    return saveAnalysis(false);
-  });
-
-  $("an-report").onclick = safe(function () {
-    return saveAnalysis(true);
-  });
-
-  $("an-new").onclick = function () {
-    if (!canReplaceSource()) return;
-
-    clearMeasurements();
-
-    if (!state.stream && video.readyState >= 2) {
-      video.pause();
-      video.currentTime = 0;
-    }
-
-    status("새 분석을 시작합니다.");
-  };
-
-  const unbindChart = CM.bindChartSeek(
-    $("an-chart"),
-    function (time) {
-      if (state.scanning || state.stream) return;
-
-      video.pause();
-
-      seekTo(time).catch(error => {
-        CM.toast(error.message);
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          finish(new Error("영상 탐색 시간이 초과되었습니다."));
+        }, 8000);
+
+        function finish(error) {
+          clearTimeout(timer);
+          video.removeEventListener("seeked", done);
+          video.removeEventListener("error", failed);
+          signal.removeEventListener("abort", aborted);
+          if (error) reject(error);
+          else resolve();
+        }
+
+        function done() { finish(); }
+        function failed() { finish(new Error("영상 탐색에 실패했습니다.")); }
+        function aborted() { finish(new Error("분석 화면이 닫혔습니다.")); }
+
+        video.addEventListener("seeked", done, { once: true });
+        video.addEventListener("error", failed, { once: true });
+        signal.addEventListener("abort", aborted, { once: true });
+
+        video.currentTime = target;
       });
     }
-  );
 
-  function beforeUnload(event) {
-    if (state.revision !== state.savedRevision) {
+    function readRange() {
+      const start = Number($("#an-range-start").value);
+      const rawEnd = $("#an-range-end").value;
+
+      const end = rawEnd === ""
+        ? video.duration
+        : Number(rawEnd);
+
+      if (
+        !finite(start) || !finite(end) ||
+        start < 0 || end <= start ||
+        !finite(video.duration) ||
+        end > video.duration + 0.15
+      ) {
+        throw new Error("영상 길이에 맞는 시작·종료 시간을 입력해 주세요.");
+      }
+
+      return { start, end: Math.min(end, video.duration) };
+    }
+
+    async function scanVideo() {
+      if (source !== "upload" || scanning || saving || sourceBusy) return;
+
+      const range = readRange();
+
+      if (range.end - range.start > 600) {
+        throw new Error("한 번에 분석할 구간은 10분 이내로 선택해 주세요.");
+      }
+
+      scanning = true;
+      cancelScan = false;
+      pausePlayback();
+      $("#an-edit").value = "none";
+      syncButtons();
+
+      try {
+        await getModel();
+
+        const total = Math.floor((range.end - range.start) * 10) + 1;
+
+        for (let index = 0; index < total; index++) {
+          if (!active || cancelScan) break;
+
+          const time = range.start + index / 10;
+          if (time >= video.duration) break;
+
+          await seekTo(time);
+
+          if (!active || cancelScan) break;
+
+          detectFrame(true);
+          draw();
+
+          if (index % 5 === 0) {
+            status(`구간 분석 중 · ${Math.round((index + 1) / total * 100)}%`);
+            updateGraph(true);
+            await new Promise(resolve => setTimeout(resolve, 0));
+          }
+        }
+
+        status(cancelScan
+          ? "구간 분석을 중단했습니다. 완료된 분석값은 남아 있습니다."
+          : "지정 구간 분석을 완료했습니다.");
+      } finally {
+        scanning = false;
+        syncButtons();
+        updateGraph(true);
+      }
+    }
+
+    function renderSnapshots() {
+      if (!active) return;
+
+      $("#an-snapshots").innerHTML = snapshots.length
+        ? snapshots.map(snapshot => `
+          <figure style="margin:0">
+            <img src="${esc(snapshot.image)}"
+              alt="저장할 동작 사진"
+              style="width:100%;border-radius:10px">
+            <figcaption class="row spread" style="margin-top:6px">
+              <span>${snapshot.t.toFixed(2)}초</span>
+              <button class="small"
+                data-remove-snapshot="${esc(snapshot.id)}">삭제</button>
+            </figcaption>
+          </figure>
+        `).join("")
+        : CM.empty("아직 저장한 사진이 없습니다.");
+    }
+
+    function takeSnapshot() {
+      if (!source || video.readyState < 2) return;
+      if (snapshots.length >= 12) {
+        CM.toast("동작 사진은 최대 12장까지 저장할 수 있습니다.");
+        return;
+      }
+
+      draw();
+
+      const output = document.createElement("canvas");
+      const ratio = Math.min(1, 960 / width);
+      output.width = Math.round(width * ratio);
+      output.height = Math.round(height * ratio);
+
+      const ctx = output.getContext("2d");
+      ctx.drawImage(video, 0, 0, output.width, output.height);
+      ctx.drawImage(canvas, 0, 0, output.width, output.height);
+
+      snapshots.push({
+        id: CM.uid(),
+        t: currentTime(),
+        image: output.toDataURL("image/jpeg", 0.85)
+      });
+
+      dirty = true;
+      renderSnapshots();
+      CM.toast("동작 사진을 추가했습니다. 분석 저장을 눌러 보관하세요.");
+    }
+
+    function pushHistory(key, before, after) {
+      history.push({
+        key,
+        before: before ? clone(before) : null,
+        after: after ? clone(after) : null
+      });
+
+      if (history.length > 40) history.shift();
+      future.length = 0;
+      dirty = true;
+      syncButtons();
+    }
+
+    function applyHistory(item, version) {
+      const value = item[version];
+
+      if (value) samples.set(item.key, clone(value));
+      else samples.delete(item.key);
+
+      dirty = true;
+      draw();
+      updateGraph(true);
+      syncButtons();
+    }
+
+    function editableSample(time) {
+      const key = keyOf(time);
+      const existing = samples.get(key);
+
+      if (existing) return { key, sample: clone(existing) };
+
+      return {
+        key,
+        sample: {
+          t: time,
+          points: Array(33).fill(null),
+          angles: {},
+          metrics: {},
+          manual: true,
+          bar: null
+        }
+      };
+    }
+
+    function editAt(event) {
+      if (!drag) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const x = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+      const y = clamp((event.clientY - rect.top) / rect.height, 0, 1);
+      const sample = drag.sample;
+
+      if (drag.mode === "bar") {
+        sample.bar = { x, y, manual: true };
+      } else {
+        sample.points[drag.pointId] = {
+          x, y, z: 0, visibility: 1, manual: true
+        };
+
+        const measured = CM.measurePose(sample.points, width, height);
+        sample.angles = measured.angles;
+        sample.metrics = measured.metrics;
+      }
+
+      sample.manual = true;
+      samples.set(drag.key, sample);
+      draw();
+    }
+
+    function finishDrag() {
+      if (!drag) return;
+
+      pushHistory(
+        drag.key,
+        drag.before,
+        samples.get(drag.key)
+      );
+
+      drag = null;
+      updateGraph(true);
+    }
+
+    on("#an-canvas", "pointerdown", event => {
+      const mode = $("#an-edit").value;
+
+      if (
+        mode === "none" || !source ||
+        scanning || saving || sourceBusy
+      ) return;
+
+      pausePlayback();
+
+      const time = currentTime();
+      const { key, sample } = editableSample(time);
+
+      drag = {
+        key,
+        sample,
+        before: samples.has(key) ? clone(samples.get(key)) : null,
+        mode,
+        pointId: Number($("#an-point").value)
+      };
+
+      canvas.setPointerCapture(event.pointerId);
+      editAt(event);
+    });
+
+    on("#an-canvas", "pointermove", editAt);
+    on("#an-canvas", "pointerup", finishDrag);
+    on("#an-canvas", "pointercancel", finishDrag);
+
+    function validOptionalNumber(selector, name) {
+      const node = $(selector);
+
+      if (node.value.trim() === "") return null;
+
+      if (!node.checkValidity()) {
+        throw new Error(`${name} 입력값을 확인해 주세요.`);
+      }
+
+      const value = Number(node.value);
+      if (!finite(value)) throw new Error(`${name} 입력값을 확인해 주세요.`);
+      return value;
+    }
+
+    async function saveRecord(openReport = false) {
+      if (saving || scanning || sourceBusy) return;
+
+      if (!samples.size) {
+        CM.toast("저장할 분석값이 없습니다.");
+        return;
+      }
+
+      pausePlayback();
+      finishDrag();
+
+      const weight = validOptionalNumber("#an-weight", "중량");
+      const targetReps = validOptionalNumber("#an-target", "목표 반복");
+      const config = repetitionConfig();
+
+      if (exercise().mode === "reps" &&
+          !(config.low >= 0 && config.high <= 180 && config.low < config.high)) {
+        throw new Error("반복 기준은 0~180°이며 굽힌 각도가 편 각도보다 작아야 합니다.");
+      }
+
+      saving = true;
+      syncButtons();
+
+      let newMediaId = null;
+
+      try {
+        const all = sortedSamples();
+        const athleteId = $("#an-athlete").value;
+        const athlete = athletes.find(item => item.id === athleteId);
+        const currentExercise = exercise();
+
+        const existing = savedId
+          ? await CM.db.get("records", savedId)
+          : null;
+
+        if (
+          source === "upload" &&
+          sourceFile &&
+          $("#an-keep-media").checked &&
+          !mediaId
+        ) {
+          newMediaId = CM.uid();
+
+          await CM.db.put("media", {
+            id: newMediaId,
+            blob: sourceFile,
+            name: sourceFile.name,
+            type: sourceFile.type,
+            createdAt: new Date().toISOString()
+          });
+        }
+
+        const now = new Date().toISOString();
+        const id = savedId || CM.uid();
+        const reps = repetitions();
+
+        let range = null;
+        if (source === "upload") range = readRange();
+
+        const record = {
+          ...(existing || {}),
+          id,
+          athleteId,
+          athleteName: athlete?.name || "게스트",
+          exerciseId: currentExercise.id,
+          exercise: { ...currentExercise },
+          view: $("#an-view").value,
+          weight,
+          targetReps,
+          createdAt: createdAt || existing?.createdAt || now,
+          updatedAt: now,
+          width,
+          height,
+          source,
+          sourceName,
+          duration: source === "upload" && finite(video.duration)
+            ? video.duration
+            : currentTime(),
+          samples: all,
+          repetitions: reps,
+          repetitionConfig: config,
+          repetitionSource: manualRepetitions.length
+            ? "manual"
+            : currentExercise.mode === "reps"
+              ? "experimental-auto"
+              : "none",
+          range,
+          snapshots: snapshots.slice(),
+          memo: $("#an-memo").value.trim(),
+          coachFeedback: existing?.coachFeedback || "",
+          mediaId: newMediaId || mediaId || existing?.mediaId || null,
+          measurementVersion: "2d-v1",
+          angleDefinition: "three-point-internal-angle",
+          barTracking: "manual",
+          clinicalValidation: false
+        };
+
+        await CM.db.put("records", record);
+
+        savedId = id;
+        mediaId = record.mediaId;
+        createdAt = record.createdAt;
+        newMediaId = null;
+        dirty = false;
+
+        CM.selectedRecord = id;
+        CM.selectedAthlete = athleteId;
+        CM.selectedExercise = currentExercise.id;
+
+        status("分析を保存しました。".replace(
+          "分析を保存しました。",
+          "분석을 저장했습니다. 재생을 계속하면 변경 사항이 추가됩니다."
+        ));
+
+        CM.toast("분석 기록을 저장했습니다.");
+
+        if (openReport) location.hash = "reports";
+      } catch (error) {
+        if (newMediaId) {
+          try {
+            await CM.db.remove("media", newMediaId);
+          } catch (cleanupError) {
+            console.warn(cleanupError);
+          }
+        }
+
+        throw error;
+      } finally {
+        saving = false;
+        syncButtons();
+      }
+    }
+
+    on("#an-camera", "click", () => connectCamera(facing));
+
+    on("#an-switch", "click", () =>
+      connectCamera(facing === "user" ? "environment" : "user")
+    );
+
+    on("#an-file", "change", async event => {
+      const file = event.target.files?.[0];
+      try {
+        await uploadFile(file);
+      } finally {
+        event.target.value = "";
+      }
+    });
+
+    on("#an-play", "click", async () => {
+      if (!source) return;
+
+      if (!video.paused) {
+        pausePlayback();
+      } else {
+        $("#an-edit").value = "none";
+
+        if (source === "upload" &&
+            finite(video.duration) &&
+            video.currentTime >= video.duration - 0.05) {
+          await seekTo(0);
+        }
+
+        await video.play();
+        if (source === "camera") startCameraClock();
+      }
+    });
+
+    on("#an-back", "click", async () => {
+      pausePlayback();
+      await seekTo(currentTime() - 0.1);
+      detectFrame(true);
+      draw();
+      updateGraph(true);
+    });
+
+    on("#an-next", "click", async () => {
+      pausePlayback();
+      await seekTo(currentTime() + 0.1);
+      detectFrame(true);
+      draw();
+      updateGraph(true);
+    });
+
+    on("#an-seek", "change", async event => {
+      pausePlayback();
+      await seekTo(Number(event.target.value));
+      detectFrame(true);
+      draw();
+      updateGraph(true);
+    });
+
+    on("#an-speed", "change", event => {
+      video.playbackRate = Number(event.target.value);
+    });
+
+    on("#an-video", "seeked", () => {
+      if (scanning || sourceBusy) return;
+      detectFrame(true);
+      draw();
+      updateGraph(true);
+    });
+
+    on("#an-scan", "click", scanVideo);
+    on("#an-cancel", "click", () => { cancelScan = true; });
+    on("#an-snapshot", "click", takeSnapshot);
+    on("#an-save", "click", () => saveRecord(false));
+    on("#an-report", "click", () => saveRecord(true));
+
+    on("#an-memo", "input", () => { dirty = true; });
+    on("#an-keep-media", "change", () => {
+      if (samples.size) dirty = true;
+    });
+
+    on("#an-edit", "change", event => {
+      if (event.target.value !== "none") {
+        pausePlayback();
+        detectFrame(true);
+        draw();
+      }
+    });
+
+    on("#an-undo", "click", () => {
+      if (saving || scanning || sourceBusy) return;
+      finishDrag();
+      const item = history.pop();
+      if (!item) return;
+      future.push(item);
+      applyHistory(item, "before");
+    });
+
+    on("#an-redo", "click", () => {
+      if (saving || scanning || sourceBusy) return;
+      const item = future.pop();
+      if (!item) return;
+      history.push(item);
+      applyHistory(item, "after");
+    });
+
+    on("#an-clear-bar", "click", () => {
+      if (saving || scanning || sourceBusy) return;
+      pausePlayback();
+
+      const key = keyOf(currentTime());
+      const sample = samples.get(key);
+
+      if (!sample?.bar) {
+        CM.toast("현재 시점에 지정한 바벨 점이 없습니다.");
+        return;
+      }
+
+      const before = clone(sample);
+      sample.bar = null;
+      pushHistory(key, before, sample);
+      draw();
+    });
+
+    on("#an-set-ghost", "click", () => {
+      const sample = nearestSample(currentTime());
+
+      if (!sample?.points?.some(CM.posePointValid)) {
+        CM.toast("기준으로 사용할 인식된 자세가 없습니다.");
+        return;
+      }
+
+      ghost = clone(sample.points);
+      $("#an-ghost").checked = true;
+      draw();
+      CM.toast("현재 자세를 화면 비교 기준으로 설정했습니다.");
+    });
+
+    on("#an-mark-start", "click", () => {
+      if (!source || saving || scanning || sourceBusy) return;
+
+      markStart = currentTime();
+      $("#an-mark-label").textContent =
+        `시작점 ${markStart.toFixed(2)}초 · 종료 시점을 지정하세요.`;
+    });
+
+    on("#an-mark-end", "click", () => {
+      if (!source || saving || scanning || sourceBusy) return;
+      if (!finite(markStart)) {
+        CM.toast("먼저 구간 시작점을 지정해 주세요.");
+        return;
+      }
+
+      const end = currentTime();
+
+      if (end <= markStart) {
+        CM.toast("종료 시점은 시작 시점보다 뒤여야 합니다.");
+        return;
+      }
+
+      const overlap = manualRepetitions.some(rep =>
+        markStart < rep.end && end > rep.start
+      );
+
+      if (overlap) {
+        CM.toast("기존 수동 반복 구간과 겹칩니다.");
+        return;
+      }
+
+      manualRepetitions.push({
+        start: markStart,
+        end,
+        duration: end - markStart,
+        source: "manual"
+      });
+
+      dirty = true;
+      markStart = null;
+      $("#an-mark-label").textContent = "수동 구간 시작점 없음";
+      updateGraph(true);
+    });
+
+    on("#an-remove-rep", "click", () => {
+      if (saving || scanning || sourceBusy) return;
+
+      if (manualRepetitions.length) {
+        manualRepetitions.pop();
+        dirty = true;
+        updateGraph(true);
+      }
+    });
+
+    on("#an-clear-reps", "click", () => {
+      if (saving || scanning || sourceBusy) return;
+      if (!manualRepetitions.length) return;
+
+      if (window.confirm("지정한 수동 반복 구간을 모두 지울까요?")) {
+        manualRepetitions.length = 0;
+        dirty = true;
+        updateGraph(true);
+      }
+    });
+
+    on("#an-snapshots", "click", event => {
+      if (saving || scanning || sourceBusy) return;
+
+      const button = event.target.closest("[data-remove-snapshot]");
+      if (!button) return;
+
+      const index = snapshots.findIndex(
+        item => item.id === button.dataset.removeSnapshot
+      );
+
+      if (index >= 0) {
+        snapshots.splice(index, 1);
+        dirty = true;
+        renderSnapshots();
+      }
+    });
+
+    for (const selector of [
+      "#an-side", "#an-skeleton", "#an-angles",
+      "#an-guides", "#an-trails", "#an-ghost", "#an-floor"
+    ]) {
+      on(selector, "change", () => {
+        draw();
+        updateGraph(true);
+      });
+    }
+
+    main.querySelectorAll("[data-joint]").forEach(node => {
+      node.addEventListener("change", () => {
+        draw();
+        updateGraph(true);
+      }, { signal });
+    });
+
+    for (const selector of ["#an-rep-key", "#an-low", "#an-high"]) {
+      on(selector, "change", () => {
+        if (samples.size) dirty = true;
+        updateGraph(true);
+      });
+    }
+
+    for (const selector of ["#an-range-start", "#an-range-end"]) {
+      on(selector, "change", () => {
+        if (samples.size) dirty = true;
+      });
+    }
+
+    on("#an-exercise", "change", () => {
+      const chosen = exercise();
+      CM.selectedExercise = chosen.id;
+
+      const metric = Object.hasOwn(jointNames, chosen.metric)
+        ? chosen.metric
+        : "knee";
+
+      $("#an-rep-key").value = `left_${metric}`;
+      updateGraph(true);
+    });
+
+    const initialMetric = Object.hasOwn(
+      jointNames,
+      selectedExercise.metric
+    ) ? selectedExercise.metric : "knee";
+
+    $("#an-rep-key").value = `left_${initialMetric}`;
+
+    const unbindChart = CM.bindChartSeek(
+      $("#an-chart"),
+      async time => {
+        if (source !== "upload" || scanning || saving || sourceBusy) return;
+
+        try {
+          pausePlayback();
+          await seekTo(time);
+          detectFrame(true);
+          draw();
+          updateGraph(true);
+        } catch (error) {
+          showError(error);
+        }
+      }
+    );
+
+    function frame(now) {
+      if (!active) return;
+
+      try {
+        if (
+          source && !sourceBusy && !scanning && !saving &&
+          !video.paused && video.readyState >= 2
+        ) {
+          if (source === "upload" && $("#an-loop").checked) {
+            try {
+              const range = readRange();
+
+              if (video.currentTime >= range.end) {
+                video.currentTime = range.start;
+              }
+            } catch {
+              $("#an-loop").checked = false;
+              CM.toast("반복 재생 구간을 확인해 주세요.");
+            }
+          }
+
+          if (now - lastDetectAt >= 100) {
+            lastDetectAt = now;
+            detectFrame();
+          }
+        }
+
+        if (source === "upload" && !video.seeking) {
+          $("#an-seek").value = String(video.currentTime || 0);
+        }
+
+        draw();
+
+        if (source && !scanning) {
+          updateGraph();
+        }
+      } catch (error) {
+        inferenceFailed = true;
+        pausePlayback();
+        showError(error);
+      }
+
+      raf = requestAnimationFrame(frame);
+    }
+
+    function beforeUnload(event) {
+      if (!dirty && !saving && !sourceBusy && !scanning) return;
       event.preventDefault();
       event.returnValue = "";
     }
-  }
 
-  window.addEventListener("beforeunload", beforeUnload);
+    window.addEventListener("beforeunload", beforeUnload, { signal });
 
-  /* app.js가 화면 전환 전에 호출합니다. */
-  CM.analysisCanLeave = function () {
-    if (state.saving) {
-      CM.toast("저장이 끝날 때까지 기다려 주세요.");
-      return false;
-    }
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        pausePlayback();
+        if (scanning) cancelScan = true;
+      }
+    }, { signal });
 
-    if (state.revision !== state.savedRevision) {
-      return window.confirm(
-        "저장하지 않은 분석 내용이 있습니다. 화면을 이동할까요?"
+    CM.analysisCanLeave = () => {
+      if (saving || sourceBusy) {
+        CM.toast("진행 중인 작업이 끝난 뒤 이동해 주세요.");
+        return false;
+      }
+
+      if (scanning) {
+        CM.toast("구간 분석을 중단한 뒤 이동해 주세요.");
+        return false;
+      }
+
+      return !dirty || window.confirm(
+        "저장하지 않은 분석값이 있습니다. 저장하지 않고 이동할까요?"
       );
-    }
+    };
 
-    return true;
+    CM.analysisCleanup = () => {
+      active = false;
+      cancelScan = true;
+      cancelAnimationFrame(raf);
+      controller.abort();
+
+      if (typeof unbindChart === "function") unbindChart();
+
+      releaseSource();
+
+      if (model) {
+        model.close();
+        model = null;
+      }
+
+      CM.analysisCanLeave = null;
+      CM.analysisCleanup = null;
+    };
+
+    syncButtons();
+    renderSnapshots();
+    updateGraph(true);
+    raf = requestAnimationFrame(frame);
   };
-
-  /* app.js가 화면 전환 시 호출합니다. */
-  CM.analysisCleanup = function () {
-    state.active = false;
-    state.cancelScan = true;
-
-    cancelAnimationFrame(state.frameId);
-
-    stopCamera();
-    video.pause();
-
-    if (state.fileUrl) {
-      URL.revokeObjectURL(state.fileUrl);
-    }
-
-    if (state.model) {
-      state.model.close();
-      state.model = null;
-    }
-
-    window.removeEventListener(
-      "beforeunload",
-      beforeUnload
-    );
-
-    unbindChart();
-
-    CM.analysisCanLeave = null;
-    CM.analysisCleanup = null;
-  };
-
-  guide();
-  refresh();
-
-  state.frameId = requestAnimationFrame(loop);
-};
+})();
