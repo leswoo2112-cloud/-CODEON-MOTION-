@@ -1,20 +1,27 @@
 /*
   실버스타 스포츠 과학원 · CODEON MOTION
-  analysis.js
+  analysis.js — 통합 교체본
 
-  지원 기능
-  - Lite / Full / Heavy 모델 선택
-  - 단일 사람 분석, 다중 감지 시 해당 프레임 보류
-  - 가시성 필터와 원본 기준점 별도 보관
-  - 부위 / 좌우 / 각도·위치 그래프
-  - 표시용 평균선, 원본 측정값 유지
-  - 카메라 전환, 영상 구간 분석
-  - 스켈레톤 / 각도 / 기준선 / 궤적 / 기준 자세
-  - 수동 기준점 / 바벨 점 / 취소·다시 실행
-  - 반복 구간 / 캡처 / 기록 저장
+  자동 기능
+  - 관절 기준점, 각도, 위치, 궤적 계산
+  - 일정 간격 유효 프레임 자동 사진 캡처
+  - 업로드 영상 지정 구간 분석
+  - 분석 완료 후 자동 저장·리포트 이동 선택
+  - 카메라 측정 종료 → 저장 → 리포트
 
-  카메라 원본 영상은 녹화하지 않습니다.
-  영상 파일은 선택적으로 브라우저에 저장합니다.
+  유지 기능
+  - Lite / Full / Heavy
+  - 전면 / 후면 카메라
+  - 관절·좌우 선택
+  - 원본 / 표시용 평균선
+  - 수동 점 수정 / 바벨 점
+  - 실행 취소·다시 실행
+  - 수동 반복 구간 / 기준 자세
+
+  주의
+  - 카메라 원본 영상은 녹화하지 않습니다.
+  - 바벨 자체의 자동 객체 추적은 포함하지 않습니다.
+  - 자동 반복 감지는 실험 기능입니다.
 */
 
 (() => {
@@ -23,11 +30,10 @@
   const CM = window.CM = window.CM || {};
   const finite = Number.isFinite;
   const esc = value => CM.escape(String(value ?? ""));
-  const clamp = (value, min, max) =>
-    Math.max(min, Math.min(max, value));
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
   const copy = value => JSON.parse(JSON.stringify(value));
 
-  const jointNames = {
+  const joints = {
     shoulder: "어깨",
     elbow: "팔꿈치",
     hip: "고관절",
@@ -35,15 +41,20 @@
     ankle: "발목"
   };
 
-  const partNames = {
-    shoulder: "어깨",
-    elbow: "팔꿈치",
+  const parts = {
+    ...joints,
     wrist: "손목",
-    hip: "고관절",
-    knee: "무릎",
-    ankle: "발목",
     trunk: "몸통",
     pelvis: "골반"
+  };
+
+  const pointIds = {
+    shoulder: { left: 11, right: 12 },
+    elbow: { left: 13, right: 14 },
+    wrist: { left: 15, right: 16 },
+    hip: { left: 23, right: 24 },
+    knee: { left: 25, right: 26 },
+    ankle: { left: 27, right: 28 }
   };
 
   CM.poseJoints = {
@@ -65,17 +76,9 @@
     31: "왼쪽 발끝", 32: "오른쪽 발끝"
   };
 
-  const partPoints = {
-    shoulder: { left: 11, right: 12 },
-    elbow: { left: 13, right: 14 },
-    wrist: { left: 15, right: 16 },
-    hip: { left: 23, right: 24 },
-    knee: { left: 25, right: 26 },
-    ankle: { left: 27, right: 28 }
-  };
-
   const edges = [
-    [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+    [11, 12], [11, 13], [13, 15],
+    [12, 14], [14, 16],
     [11, 23], [12, 24], [23, 24],
     [23, 25], [25, 27], [24, 26], [26, 28],
     [27, 29], [29, 31], [27, 31],
@@ -84,18 +87,17 @@
 
   const leftIds = new Set([11, 13, 15, 23, 25, 27, 29, 31]);
   const rightIds = new Set([12, 14, 16, 24, 26, 28, 30, 32]);
+
   const colors = [
     "#50daf2", "#f58cce", "#f5d76e", "#8ce5ac",
     "#b8a1ff", "#ffad75", "#7db5ff", "#dddddd"
   ];
 
-  CM.posePointValid = point => Boolean(
-    point &&
-    finite(point.x) && finite(point.y) &&
-    (
-      point.manual ||
-      (finite(point.visibility) && point.visibility >= 0.55)
-    )
+  CM.posePointValid = p => Boolean(
+    p &&
+    finite(p.x) &&
+    finite(p.y) &&
+    (p.manual || (finite(p.visibility) && p.visibility >= 0.55))
   );
 
   CM.angle2D = (a, b, c, width = 1, height = 1) => {
@@ -105,8 +107,8 @@
     const uy = (a.y - b.y) * height;
     const vx = (c.x - b.x) * width;
     const vy = (c.y - b.y) * height;
-    const denominator = Math.hypot(ux, uy) * Math.hypot(vx, vy);
 
+    const denominator = Math.hypot(ux, uy) * Math.hypot(vx, vy);
     if (denominator < 1e-8) return null;
 
     return Math.acos(
@@ -130,14 +132,14 @@
     function tilt(a, b) {
       if (!CM.posePointValid(a) || !CM.posePointValid(b)) return null;
 
-      let result = Math.atan2(
+      let angle = Math.atan2(
         (b.y - a.y) * height,
         (b.x - a.x) * width
       ) * 180 / Math.PI;
 
-      if (result > 90) result -= 180;
-      if (result < -90) result += 180;
-      return result;
+      if (angle > 90) angle -= 180;
+      if (angle < -90) angle += 180;
+      return angle;
     }
 
     for (const side of ["left", "right"]) {
@@ -163,7 +165,10 @@
     metrics.shoulderTilt = tilt(points[11], points[12]);
     metrics.hipTilt = tilt(points[23], points[24]);
 
-    if (CM.posePointValid(points[23]) && CM.posePointValid(points[24])) {
+    if (
+      CM.posePointValid(points[23]) &&
+      CM.posePointValid(points[24])
+    ) {
       metrics.pelvisX = (points[23].x + points[24].x) * 50;
       metrics.pelvisY = (points[23].y + points[24].y) * 50;
     } else {
@@ -186,7 +191,7 @@
   ) => {
     if (!finite(low) || !finite(high) || low >= high) return [];
 
-    const output = [];
+    const result = [];
     let ready = false;
     let moving = false;
     let start = 0;
@@ -195,10 +200,10 @@
     let previousTime = null;
 
     for (const sample of samples.slice().sort((a, b) => a.t - b.t)) {
-      const angle = sample.angles?.[key];
+      const value = sample.angles?.[key];
 
       if (
-        !finite(angle) ||
+        !finite(value) ||
         (previousTime !== null && sample.t - previousTime > maxGap)
       ) {
         ready = false;
@@ -207,9 +212,9 @@
       }
 
       previousTime = sample.t;
-      if (!finite(angle)) continue;
+      if (!finite(value)) continue;
 
-      if (!ready && angle >= high) {
+      if (!ready && value >= high) {
         ready = true;
         start = sample.t;
         continue;
@@ -218,25 +223,25 @@
       if (!ready) continue;
 
       if (!moving) {
-        if (angle >= high) start = sample.t;
+        if (value >= high) start = sample.t;
 
-        if (angle <= low) {
+        if (value <= low) {
           moving = true;
           bottom = sample.t;
-          minimum = angle;
+          minimum = value;
         }
 
         continue;
       }
 
-      if (angle < minimum) {
-        minimum = angle;
+      if (value < minimum) {
+        minimum = value;
         bottom = sample.t;
       }
 
-      if (angle >= high) {
+      if (value >= high) {
         if (sample.t - start >= minDuration) {
-          output.push({
+          result.push({
             start,
             bottom,
             end: sample.t,
@@ -250,16 +255,16 @@
         }
 
         moving = false;
-        minimum = Infinity;
         start = sample.t;
+        minimum = Infinity;
       }
     }
 
-    return output;
+    return result;
   };
 
-  function smoothData(data) {
-    const result = data.map(point => ({ ...point }));
+  function smooth(data) {
+    const result = data.map(p => ({ ...p }));
     let start = 0;
 
     while (start < data.length) {
@@ -269,22 +274,20 @@
       }
 
       let end = start;
+
       while (
         end + 1 < data.length &&
         finite(data[end + 1].y) &&
         data[end + 1].x - data[end].x <= 0.8
       ) end++;
 
-      for (let index = start; index <= end; index++) {
-        const from = Math.max(start, index - 2);
-        const to = Math.min(end, index + 2);
+      for (let i = start; i <= end; i++) {
+        const from = Math.max(start, i - 2);
+        const to = Math.min(end, i + 2);
         let sum = 0;
 
-        for (let cursor = from; cursor <= to; cursor++) {
-          sum += data[cursor].y;
-        }
-
-        result[index].y = sum / (to - from + 1);
+        for (let j = from; j <= to; j++) sum += data[j].y;
+        result[i].y = sum / (to - from + 1);
       }
 
       start = end + 1;
@@ -301,11 +304,11 @@
     const main = document.querySelector("#main");
 
     const initialExercise =
-      CM.exercises.find(item => item.id === CM.selectedExercise) ||
+      CM.exercises.find(x => x.id === CM.selectedExercise) ||
       CM.exercises[0];
 
     if (!initialExercise) {
-      main.innerHTML = CM.empty("운동 라이브러리가 비어 있습니다.");
+      main.innerHTML = CM.empty("등록된 운동이 없습니다.");
       return;
     }
 
@@ -317,9 +320,9 @@
         ${checked ? "checked" : ""}> ${label}</label>`;
 
     main.innerHTML = `
-      ${CM.heading("자세 분석", "SILVERSTAR · MOTION LAB", `
-        ${button("an-save", "분석 저장", true)}
-        ${button("an-report", "저장 후 리포트")}
+      ${CM.heading("자세 분석", "SILVERSTAR · AUTOMATIC MOTION ANALYSIS", `
+        ${button("an-save", "현재 분석 저장")}
+        ${button("an-finish", "측정 종료 · 리포트", true)}
       `)}
 
       <div class="analysis-layout">
@@ -329,10 +332,10 @@
           <label>선수
             <select id="an-athlete">
               <option value="">게스트</option>
-              ${athletes.map(item => `
-                <option value="${esc(item.id)}"
-                  ${item.id === CM.selectedAthlete ? "selected" : ""}>
-                  ${esc(item.name)}
+              ${athletes.map(a => `
+                <option value="${esc(a.id)}"
+                  ${a.id === CM.selectedAthlete ? "selected" : ""}>
+                  ${esc(a.name)}
                 </option>
               `).join("")}
             </select>
@@ -340,10 +343,10 @@
 
           <label style="display:block;margin-top:12px">운동
             <select id="an-exercise">
-              ${CM.exercises.map(item => `
-                <option value="${esc(item.id)}"
-                  ${item.id === initialExercise.id ? "selected" : ""}>
-                  ${esc(item.category)} · ${esc(item.name)}
+              ${CM.exercises.map(ex => `
+                <option value="${esc(ex.id)}"
+                  ${ex.id === initialExercise.id ? "selected" : ""}>
+                  ${esc(ex.category)} · ${esc(ex.name)}
                 </option>
               `).join("")}
             </select>
@@ -371,15 +374,15 @@
           <hr>
           <h3>인식 설정</h3>
 
-          <label>인식 모델
+          <label>모델
             <select id="an-model">
               <option value="lite">Lite · 속도 우선</option>
-              <option value="full" selected>Full · 기본 정밀 모드</option>
+              <option value="full" selected>Full · 기본</option>
               <option value="heavy">Heavy · 무거운 모델</option>
             </select>
           </label>
 
-          <label style="display:block;margin-top:12px">기준점 가시성 필터
+          <label style="display:block;margin-top:12px">가시성 필터
             <select id="an-threshold">
               <option value="0.55">기본 · 0.55 이상</option>
               <option value="0.75" selected>엄격 · 0.75 이상</option>
@@ -388,12 +391,12 @@
           </label>
 
           <p class="muted" style="font-size:12px">
-            숫자는 모델의 가시성 기준이며 정확도 비율이 아닙니다.
-            측정 시작 후 설정 변경은 새 측정에서 적용하세요.
-            두 명 이상 감지된 프레임은 분석을 보류합니다.
+            필터 값은 정확도 비율이 아닙니다.
+            한 사람만 촬영하세요.
+            여러 사람이 감지되면 해당 프레임을 보류합니다.
           </p>
 
-          <div class="stack" style="display:grid;gap:8px">
+          <div style="display:grid;gap:8px">
             ${button("an-camera", "카메라 연결", true)}
             ${button("an-switch", "전면 / 후면 전환")}
             ${button("an-new", "새 측정 준비")}
@@ -410,8 +413,30 @@
           </div>
 
           <p class="muted" style="font-size:12px">
-            카메라 영상은 녹화하지 않습니다.
-            분석값과 동작 사진을 저장합니다.
+            카메라 원본은 녹화하지 않습니다.
+            분석값과 캡처 사진을 저장합니다.
+          </p>
+
+          <hr>
+          <h3>자동화</h3>
+
+          <div style="display:grid;gap:10px">
+            ${check("an-auto-photo", "자동 동작 사진", true)}
+            ${check("an-auto-finish", "영상 분석 완료 후 저장·리포트", true)}
+          </div>
+
+          <label style="display:block;margin-top:12px">카메라 자동 사진 간격
+            <select id="an-photo-interval">
+              <option value="3">3초</option>
+              <option value="5" selected>5초</option>
+              <option value="10">10초</option>
+            </select>
+          </label>
+
+          <p class="muted" style="font-size:12px">
+            사진은 최대 12장입니다.
+            자동 사진은 일정 간격의 유효 프레임이며
+            동작의 최저점으로 판정한 사진이 아닙니다.
           </p>
 
           <hr>
@@ -420,7 +445,7 @@
           <div class="grid g2">
             <label>시작 초
               <input id="an-start" type="number"
-                value="0" min="0" step="0.1">
+                min="0" value="0" step="0.1">
             </label>
             <label>종료 초
               <input id="an-end" type="number"
@@ -428,21 +453,21 @@
             </label>
           </div>
 
-          <div class="stack" style="display:grid;gap:8px;margin-top:12px">
-            ${button("an-scan", "지정 구간 분석")}
+          <div style="display:grid;gap:8px;margin-top:12px">
+            ${button("an-scan", "지정 구간 자동 분석", true)}
             <button id="an-cancel" hidden>분석 중단</button>
           </div>
 
           <div style="margin-top:12px">
-            ${check("an-loop", "지정 구간 반복 재생")}
+            ${check("an-loop", "구간 반복 재생")}
           </div>
 
           <hr>
-          <h3>반복 감지 · 실험</h3>
+          <h3>자동 반복 감지 · 실험</h3>
 
           <label>기준 관절
             <select id="an-rep-key">
-              ${Object.entries(jointNames).map(([key, name]) => `
+              ${Object.entries(joints).map(([key, name]) => `
                 <option value="left_${key}">왼쪽 ${name}</option>
                 <option value="right_${key}">오른쪽 ${name}</option>
               `).join("")}
@@ -461,9 +486,9 @@
           </div>
 
           <p class="muted" style="font-size:12px">
-            큰 각도 → 작은 각도 → 큰 각도 순서의 반복만 감지합니다.
-            위 숫자는 정상 자세 기준이 아닙니다.
-            종목에 맞게 조정하거나 수동 구간을 사용하세요.
+            큰 각도 → 작은 각도 → 큰 각도 순서를 감지합니다.
+            숫자는 정상 자세 기준이 아닙니다.
+            종목에 따라 조정하거나 수동 구간을 사용하세요.
           </p>
 
           <label>메모
@@ -477,7 +502,7 @@
               style="position:relative;aspect-ratio:16/9;
                      background:#030b11;overflow:hidden;border-radius:12px">
               <video id="an-video" muted playsinline
-                style="width:100%;height:100%;display:block;object-fit:fill">
+                style="width:100%;height:100%;object-fit:fill;display:block">
               </video>
               <canvas id="an-canvas"
                 style="position:absolute;inset:0;width:100%;height:100%;
@@ -489,26 +514,26 @@
               </div>
             </div>
 
-            <p id="an-status" role="status" class="muted">분석 준비</p>
+            <p id="an-status" role="status" class="muted">측정 준비</p>
             <p id="an-quality" class="muted">관절 인식 대기</p>
 
             <div class="row" style="gap:8px;flex-wrap:wrap">
               ${button("an-back", "−0.1초")}
               ${button("an-play", "재생 / 정지")}
               ${button("an-next", "+0.1초")}
-              <select id="an-speed" aria-label="재생 속도"
-                style="width:auto">
+              <select id="an-speed" aria-label="재생 속도" style="width:auto">
                 <option value="0.25">0.25배</option>
                 <option value="0.5">0.5배</option>
                 <option value="1" selected>1배</option>
                 <option value="1.5">1.5배</option>
                 <option value="2">2배</option>
               </select>
-              ${button("an-snapshot", "동작 사진")}
+              ${button("an-snapshot", "사진 직접 추가")}
             </div>
 
-            <input id="an-seek" type="range" min="0" max="1"
-              step="0.01" value="0" aria-label="영상 시점"
+            <input id="an-seek" type="range"
+              min="0" max="1" step="0.01" value="0"
+              aria-label="영상 시점"
               style="width:100%;margin-top:12px">
 
             <div class="toggles row"
@@ -516,12 +541,13 @@
               ${check("an-skeleton", "스켈레톤", true)}
               ${check("an-angles", "각도", true)}
               ${check("an-guides", "기준선", true)}
-              ${check("an-trails", "선택 부위 궤적")}
+              ${check("an-trails", "선택 부위 궤적", true)}
               ${check("an-ghost", "기준 자세")}
-              ${check("an-only", "선택 부위만 표시")}
+              ${check("an-only", "선택 부위만")}
             </div>
 
-            <div class="row" style="gap:10px;flex-wrap:wrap;margin-top:12px">
+            <div class="row"
+              style="gap:10px;flex-wrap:wrap;margin-top:12px">
               <label>수평 기준선 높이 %
                 <input id="an-floor" type="number"
                   min="0" max="100" value="85" style="max-width:120px">
@@ -531,14 +557,13 @@
           </section>
 
           <section class="panel" style="margin-bottom:18px">
-            <h2>보고 싶은 부위 선택</h2>
+            <h2>보고 싶은 부위</h2>
 
             <div class="toggles row" style="gap:12px;flex-wrap:wrap">
-              ${Object.entries(partNames).map(([key, name]) => `
+              ${Object.entries(parts).map(([key, name]) => `
                 <label>
                   <input type="checkbox" data-part="${key}"
-                    ${key === "knee" ? "checked" : ""}>
-                  ${name}
+                    ${key === "knee" ? "checked" : ""}> ${name}
                 </label>
               `).join("")}
             </div>
@@ -573,19 +598,27 @@
             <div id="an-chart" class="chart" style="margin-top:14px"></div>
 
             <p class="muted">
-              평균선은 표시용입니다. 스켈레톤·각도 계산·리포트 원본값은
-              변경하지 않습니다. 인식 공백을 임의로 연결하지 않습니다.
+              평균선은 표시용입니다.
+              계산·저장·리포트 원본값은 바꾸지 않습니다.
+              인식 공백은 연결하지 않습니다.
             </p>
           </section>
 
           <section class="panel" style="margin-bottom:18px">
-            <h2>수동 기준점 수정</h2>
+            <h2>자동 반복 요약</h2>
+            <p id="an-rep-count" class="muted">0회</p>
+            <div id="an-rep-bars" class="chart"></div>
+            <div id="an-rep-list"></div>
+          </section>
+
+          <section class="panel" style="margin-bottom:18px">
+            <h2>수동 보정 · 필요한 경우만</h2>
 
             <div class="grid g2">
               <label>편집 모드
                 <select id="an-edit">
                   <option value="none">편집 안 함</option>
-                  <option value="joint">관절 위치 수정</option>
+                  <option value="joint">관절 기준점 수정</option>
                   <option value="bar">바벨 점 지정</option>
                 </select>
               </label>
@@ -600,8 +633,8 @@
             </div>
 
             <p class="muted">
-              편집 모드를 선택한 뒤 영상의 위치를 클릭하거나 드래그하세요.
-              바벨 점은 수동으로 지정합니다.
+              편집 모드를 선택한 뒤 위치를 클릭하거나 드래그하세요.
+              바벨 자동 추적은 포함하지 않습니다.
             </p>
 
             <div class="row" style="gap:8px;flex-wrap:wrap">
@@ -609,28 +642,24 @@
               ${button("an-redo", "다시 실행")}
               ${button("an-clear-bar", "현재 바벨 점 삭제")}
             </div>
-          </section>
 
-          <section class="panel" style="margin-bottom:18px">
-            <div class="row spread">
-              <h2>반복 구간</h2>
-              <strong id="an-rep-count">0회</strong>
-            </div>
+            <hr>
 
+            <h3>수동 반복 구간</h3>
             <div class="row" style="gap:8px;flex-wrap:wrap">
               ${button("an-mark-start", "현재 시점 시작")}
               ${button("an-mark-end", "현재 시점 종료")}
-              ${button("an-remove-rep", "마지막 수동 구간 취소")}
+              ${button("an-remove-rep", "마지막 구간 취소")}
               ${button("an-clear-reps", "수동 구간 지우기")}
             </div>
-
             <p id="an-mark-label" class="muted">시작점 없음</p>
-            <div id="an-rep-list"></div>
           </section>
 
           <section class="panel">
-            <h2>동작 사진</h2>
-            <p class="muted">최대 12장. 분석 저장 시 함께 보관합니다.</p>
+            <h2>리포트에 들어갈 동작 사진</h2>
+            <p id="an-photo-status" class="muted">
+              자동 캡처 대기 · 최대 12장
+            </p>
             <div id="an-snapshots" class="grid g3"></div>
           </section>
         </div>
@@ -650,17 +679,19 @@
     let sourceName = "";
     let objectURL = null;
     let stream = null;
+    let facing = "environment";
 
     let model = null;
-    let modelName = "";
+    let loadedModelName = "";
     let modelPromise = null;
-    let facing = "environment";
+
     let width = 1280;
     let height = 720;
 
     let busy = false;
     let scanning = false;
     let saving = false;
+    let finishing = false;
     let cancelScan = false;
     let dirty = false;
     let inferenceFailed = false;
@@ -670,23 +701,28 @@
     let cameraRunning = false;
 
     let savedId = null;
-    let savedMediaId = null;
-    let recordCreatedAt = null;
+    let mediaId = null;
+    let createdAt = null;
+
     let ghost = null;
     let markStart = null;
     let drag = null;
 
     let raf = 0;
-    let lastDetectionAt = 0;
+    let lastDetectAt = 0;
     let lastVideoTime = -1;
     let lastGraphAt = 0;
-
     let revision = 0;
     let cachedRevision = -1;
     let cachedSamples = [];
 
+    let nextCameraPhotoAt = 0;
+    let scanPhotoTargets = [];
+    let scanPhotoIndex = 0;
+    let videoAutoFinished = false;
+
     const samples = new Map();
-    const snapshots = [];
+    const photos = [];
     const manualReps = [];
     const undo = [];
     const redo = [];
@@ -711,18 +747,18 @@
         NotReadableError: "다른 앱의 카메라 사용을 종료하고 다시 시도해 주세요."
       };
 
-      const message = messages[error?.name] ||
+      const text = messages[error?.name] ||
         error?.message || "작업 중 오류가 발생했습니다.";
 
-      $("#an-status").textContent = message;
-      CM.toast(message, 6000);
+      $("#an-status").textContent = text;
+      CM.toast(text, 6000);
     }
 
-    function status(message) {
-      if (active) $("#an-status").textContent = message;
+    function status(text) {
+      if (active) $("#an-status").textContent = text;
     }
 
-    function changeData() {
+    function changed() {
       revision++;
       dirty = true;
     }
@@ -735,13 +771,13 @@
       return cachedSamples;
     }
 
-    function currentExercise() {
-      return CM.exercises.find(item => item.id === $("#an-exercise").value) ||
+    function exercise() {
+      return CM.exercises.find(x => x.id === $("#an-exercise").value) ||
         initialExercise;
     }
 
-    function keyOf(time) {
-      return Math.round(time * 10);
+    function keyOf(t) {
+      return Math.round(t * 10);
     }
 
     function timeNow() {
@@ -765,14 +801,15 @@
 
     async function play() {
       await video.play();
+
       if (source === "camera" && !cameraRunning) {
         cameraStartedAt = performance.now();
         cameraRunning = true;
       }
     }
 
-    function nearest(time) {
-      const key = keyOf(time);
+    function nearest(t) {
+      const key = keyOf(t);
       let best = null;
       let distance = Infinity;
 
@@ -780,12 +817,13 @@
         const sample = samples.get(key + offset);
         if (!sample) continue;
 
-        const delta = Math.abs(sample.t - time);
+        const delta = Math.abs(sample.t - t);
         if (delta <= 0.2 && delta < distance) {
           best = sample;
           distance = delta;
         }
       }
+
       return best;
     }
 
@@ -795,26 +833,24 @@
     }
 
     function sides() {
-      const value = $("#an-side").value;
-      return value === "both" ? ["left", "right"] : [value];
+      const side = $("#an-side").value;
+      return side === "both" ? ["left", "right"] : [side];
     }
 
-    function selectedIds() {
+    function chosenIds() {
       const result = new Set();
 
       for (const part of chosenParts()) {
         for (const side of sides()) {
-          if (part === "trunk") {
-            (side === "left" ? [11, 23] : [12, 24])
-              .forEach(id => result.add(id));
-          } else if (part === "pelvis") {
-            result.add(23);
-            result.add(24);
-          } else if (CM.poseJoints[part]) {
-            CM.poseJoints[part][side].forEach(id => result.add(id));
-          } else {
-            result.add(partPoints[part][side]);
-          }
+          const ids = part === "pelvis"
+            ? [23, 24]
+            : part === "trunk"
+              ? side === "left" ? [11, 23] : [12, 24]
+              : CM.poseJoints[part]
+                ? CM.poseJoints[part][side]
+                : [pointIds[part][side]];
+
+          ids.forEach(id => result.add(id));
         }
       }
 
@@ -827,7 +863,7 @@
         (side === "left" ? leftIds.has(id) : rightIds.has(id));
     }
 
-    function centerPoint(sample, ids) {
+    function center(sample, ids) {
       if (!sample || !ids.every(id =>
         CM.posePointValid(sample.points?.[id])
       )) return null;
@@ -840,15 +876,13 @@
 
     function partPoint(sample, part, side) {
       if (!sample) return null;
-
+      if (part === "pelvis") return center(sample, [23, 24]);
       if (part === "trunk") {
-        return centerPoint(sample, side === "left" ? [11, 23] : [12, 24]);
+        return center(sample, side === "left" ? [11, 23] : [12, 24]);
       }
 
-      if (part === "pelvis") return centerPoint(sample, [23, 24]);
-
-      const point = sample.points?.[partPoints[part][side]];
-      return CM.posePointValid(point) ? point : null;
+      const p = sample.points?.[pointIds[part][side]];
+      return CM.posePointValid(p) ? p : null;
     }
 
     function partValue(sample, part, side, mode) {
@@ -861,53 +895,53 @@
         return sample.angles?.[`${side}_${part}`] ?? null;
       }
 
-      const point = partPoint(sample, part, side);
-      if (!point) return null;
-      return (mode === "x" ? point.x : point.y) * 100;
+      const p = partPoint(sample, part, side);
+      return p ? (mode === "x" ? p.x : p.y) * 100 : null;
+    }
+
+    function locked() {
+      return busy || scanning || saving || finishing;
     }
 
     function syncUI() {
       if (!active) return;
-      const locked = busy || scanning || saving;
-      const measured = samples.size > 0;
+
+      const lock = locked();
+      const measurementStarted = Boolean(source) || samples.size > 0;
 
       for (const id of [
         "an-camera", "an-switch", "an-new", "an-file",
-        "an-save", "an-report"
-      ]) {
-        $(`#${id}`).disabled = locked;
-      }
+        "an-save", "an-finish"
+      ]) $(`#${id}`).disabled = lock;
 
       for (const id of [
         "an-athlete", "an-exercise", "an-view", "an-weight", "an-target",
         "an-model", "an-threshold"
-      ]) {
-        $(`#${id}`).disabled = locked || measured || Boolean(source);
-      }
+      ]) $(`#${id}`).disabled = lock || measurementStarted;
 
       for (const id of ["an-back", "an-next", "an-seek", "an-speed"]) {
-        $(`#${id}`).disabled = locked || source !== "upload";
+        $(`#${id}`).disabled = lock || source !== "upload";
       }
 
       for (const id of [
-        "an-start", "an-end", "an-rep-key", "an-low", "an-high", "an-memo"
-      ]) {
-        $(`#${id}`).disabled = locked;
-      }
+        "an-start", "an-end", "an-rep-key", "an-low", "an-high",
+        "an-memo", "an-auto-photo", "an-auto-finish", "an-photo-interval"
+      ]) $(`#${id}`).disabled = lock;
 
-      $("#an-play").disabled = locked || !source;
-      $("#an-scan").disabled = locked || source !== "upload";
+      $("#an-play").disabled = lock || !source;
+      $("#an-scan").disabled = lock || source !== "upload";
       $("#an-cancel").hidden = !scanning;
-      $("#an-edit").disabled = locked || !source;
-      $("#an-snapshot").disabled = locked || !source;
-      $("#an-keep-media").disabled = locked || source !== "upload";
-      $("#an-undo").disabled = locked || !undo.length;
-      $("#an-redo").disabled = locked || !redo.length;
+      $("#an-edit").disabled = lock || !source;
+      $("#an-snapshot").disabled = lock || !source;
+      $("#an-keep-media").disabled = lock || source !== "upload";
+      $("#an-undo").disabled = lock || !undo.length;
+      $("#an-redo").disabled = lock || !redo.length;
     }
 
     async function ensureModel() {
       const requested = $("#an-model").value;
-      if (model && modelName === requested) return model;
+
+      if (model && loadedModelName === requested) return model;
       if (modelPromise) return modelPromise;
 
       status(`${requested.toUpperCase()} 모델을 불러오는 중입니다…`);
@@ -921,32 +955,29 @@
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm"
         );
 
-        const nextModel = await vision.PoseLandmarker.createFromOptions(
-          files,
-          {
-            baseOptions: {
-              modelAssetPath:
-                "https://storage.googleapis.com/mediapipe-models/" +
-                `pose_landmarker/pose_landmarker_${requested}/float16/1/` +
-                `pose_landmarker_${requested}.task`,
-              delegate: "CPU"
-            },
-            runningMode: "IMAGE",
-            numPoses: 2,
-            minPoseDetectionConfidence: 0.6,
-            minPosePresenceConfidence: 0.6,
-            outputSegmentationMasks: false
-          }
-        );
+        const next = await vision.PoseLandmarker.createFromOptions(files, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/" +
+              `pose_landmarker/pose_landmarker_${requested}/float16/1/` +
+              `pose_landmarker_${requested}.task`,
+            delegate: "CPU"
+          },
+          runningMode: "IMAGE",
+          numPoses: 2,
+          minPoseDetectionConfidence: 0.6,
+          minPosePresenceConfidence: 0.6,
+          outputSegmentationMasks: false
+        });
 
         if (!active) {
-          nextModel.close();
+          next.close();
           throw new Error("분석 화면이 닫혔습니다.");
         }
 
         model?.close();
-        model = nextModel;
-        modelName = requested;
+        model = next;
+        loadedModelName = requested;
         return model;
       })();
 
@@ -961,11 +992,13 @@
       pause();
       stream?.getTracks().forEach(track => track.stop());
       stream = null;
+
       video.srcObject = null;
       video.removeAttribute("src");
       video.load();
 
       if (objectURL) URL.revokeObjectURL(objectURL);
+
       objectURL = null;
       source = null;
       sourceFile = null;
@@ -974,22 +1007,29 @@
 
     function resetMeasurement() {
       samples.clear();
-      snapshots.length = 0;
+      photos.length = 0;
       manualReps.length = 0;
       undo.length = 0;
       redo.length = 0;
       revision++;
+
       savedId = null;
-      savedMediaId = null;
-      recordCreatedAt = null;
+      mediaId = null;
+      createdAt = null;
       ghost = null;
       markStart = null;
       drag = null;
+
       cameraElapsed = 0;
       cameraRunning = false;
       lastVideoTime = -1;
       inferenceFailed = false;
       dirty = false;
+
+      nextCameraPhotoAt = 0;
+      scanPhotoTargets = [];
+      scanPhotoIndex = 0;
+      videoAutoFinished = false;
 
       $("#an-edit").value = "none";
       $("#an-ghost").checked = false;
@@ -999,16 +1039,15 @@
       $("#an-seek").value = "0";
       $("#an-memo").value = "";
       $("#an-mark-label").textContent = "시작점 없음";
-      $("#an-quality").textContent = "관절 인식 대기";
       $("#an-placeholder").style.display = "grid";
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      renderSnapshots();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      renderPhotos();
       updateGraph(true);
     }
 
     function mayReset() {
-      if (busy || scanning || saving) return false;
+      if (locked()) return false;
 
       if (dirty) {
         return window.confirm(
@@ -1017,55 +1056,57 @@
         );
       }
 
-      if (samples.size || snapshots.length) {
+      if (samples.size || photos.length) {
         return window.confirm(
-          "새 측정을 시작할까요? 이미 저장한 기록은 유지됩니다."
+          "새 측정을 시작할까요? 이미 저장된 기록은 유지됩니다."
         );
       }
 
       return true;
     }
 
-    function waitVideo() {
+    function videoEvent(eventName, action, timeoutMs = 15000) {
       return new Promise((resolve, reject) => {
-        if (video.readyState >= 2 && video.videoWidth) {
-          resolve();
-          return;
-        }
-
-        const timeout = setTimeout(
+        const timer = setTimeout(
           () => finish(new Error("영상 준비 시간이 초과되었습니다.")),
-          15000
+          timeoutMs
         );
 
         function finish(error) {
-          clearTimeout(timeout);
-          video.removeEventListener("loadeddata", ready);
+          clearTimeout(timer);
+          video.removeEventListener(eventName, done);
           video.removeEventListener("error", fail);
           signal.removeEventListener("abort", abort);
+
           if (error) reject(error);
           else resolve();
         }
 
-        function ready() {
-          if (video.videoWidth) finish();
-        }
-        function fail() {
-          finish(new Error("영상 형식을 재생할 수 없습니다."));
-        }
-        function abort() {
-          finish(new Error("화면이 닫혔습니다."));
-        }
+        function done() { finish(); }
+        function fail() { finish(new Error("영상을 읽을 수 없습니다.")); }
+        function abort() { finish(new Error("화면이 닫혔습니다.")); }
 
-        video.addEventListener("loadeddata", ready);
-        video.addEventListener("error", fail);
+        video.addEventListener(eventName, done, { once: true });
+        video.addEventListener("error", fail, { once: true });
         signal.addEventListener("abort", abort, { once: true });
+
+        try { action(); } catch (error) { finish(error); }
       });
+    }
+
+    async function waitVideo() {
+      if (video.readyState >= 2 && video.videoWidth) return;
+      await videoEvent("loadeddata", () => {});
     }
 
     function sizeVideo() {
       width = video.videoWidth;
       height = video.videoHeight;
+
+      if (!width || !height) {
+        throw new Error("영상 크기를 확인하지 못했습니다.");
+      }
+
       canvas.width = width;
       canvas.height = height;
       $("#an-stage").style.aspectRatio = `${width}/${height}`;
@@ -1103,6 +1144,7 @@
 
         stream = acquired;
         video.srcObject = stream;
+
         await video.play();
         await waitVideo();
 
@@ -1114,8 +1156,8 @@
 
         source = "camera";
         sourceName = track.label || "카메라";
-        sizeVideo();
 
+        sizeVideo();
         cameraStartedAt = performance.now();
         cameraRunning = true;
 
@@ -1125,10 +1167,10 @@
             actual === "environment" ? "후면" : "방향 확인 불가"
           }`;
 
-        $("#an-switch").textContent = facing === "user"
-          ? "후면 카메라로 전환" : "전면 카메라로 전환";
+        $("#an-switch").textContent =
+          facing === "user" ? "후면 카메라로 전환" : "전면 카메라로 전환";
 
-        status("분석 중 · 한 사람만 촬영하세요. 화면은 좌우 반전하지 않습니다.");
+        status("카메라 측정 중 · 끝나면 ‘측정 종료 · 리포트’를 누르세요.");
       } catch (error) {
         releaseSource();
         throw error;
@@ -1140,6 +1182,7 @@
 
     async function openFile(file) {
       if (!file || !mayReset()) return;
+
       busy = true;
       syncUI();
 
@@ -1149,9 +1192,11 @@
         resetMeasurement();
 
         objectURL = URL.createObjectURL(file);
-        video.src = objectURL;
-        video.load();
-        await waitVideo();
+
+        await videoEvent("loadeddata", () => {
+          video.src = objectURL;
+          video.load();
+        });
 
         source = "upload";
         sourceFile = file;
@@ -1160,11 +1205,11 @@
 
         if (finite(video.duration)) {
           $("#an-seek").max = video.duration;
-          $("#an-end").value = String(video.duration);
+          $("#an-end").value = video.duration;
         }
 
         detect();
-        status(`영상 준비 완료 · ${file.name}`);
+        status("영상 준비 완료 · 지정 구간 자동 분석을 누르세요.");
       } catch (error) {
         releaseSource();
         throw error;
@@ -1178,14 +1223,15 @@
 
     function detect() {
       if (
-        !active || !source || !model || inferenceFailed ||
-        video.readyState < 2 || video.seeking
-      ) return;
+        !active || !source || !model ||
+        inferenceFailed || video.readyState < 2 || video.seeking
+      ) return null;
 
-      const time = timeNow();
-      const key = keyOf(time);
+      const t = timeNow();
+      const key = keyOf(t);
+      const existing = samples.get(key);
 
-      if (samples.has(key)) return;
+      if (existing) return existing;
 
       const result = model.detect(video);
       const detected = result.landmarks || [];
@@ -1193,24 +1239,22 @@
       const threshold = Number($("#an-threshold").value);
 
       const rawPoints = count === 1
-        ? detected[0].map(point => ({
-            x: point.x,
-            y: point.y,
-            z: point.z,
-            visibility: finite(point.visibility) ? point.visibility : 0
+        ? detected[0].map(p => ({
+            x: p.x,
+            y: p.y,
+            z: p.z,
+            visibility: finite(p.visibility) ? p.visibility : 0
           }))
         : Array(33).fill(null);
 
-      const points = rawPoints.map(point =>
-        point && point.visibility >= threshold
-          ? { ...point }
-          : null
+      const points = rawPoints.map(p =>
+        p && p.visibility >= threshold ? { ...p } : null
       );
 
       const measured = CM.measurePose(points, width, height);
 
-      samples.set(key, {
-        t: time,
+      const sample = {
+        t,
         rawPoints,
         points,
         angles: measured.angles,
@@ -1224,14 +1268,17 @@
             ? "no-person"
             : count > 1 ? "multiple-people" : "single-person"
         }
-      });
+      };
 
-      changeData();
+      samples.set(key, sample);
+      changed();
+
       if (samples.size === 1) syncUI();
+      return sample;
     }
 
-    function drawSkeleton(points, isGhost = false) {
-      const selected = selectedIds();
+    function drawSkeleton(points, ghostMode = false) {
+      const selected = chosenIds();
       const only = $("#an-only").checked;
       const scale = Math.max(1, width / 800);
 
@@ -1240,9 +1287,11 @@
         if (only && !(selected.has(a) && selected.has(b))) continue;
         if (![points[a], points[b]].every(CM.posePointValid)) continue;
 
-        ctx.strokeStyle = isGhost ? "rgba(255,255,255,.3)" :
-          selected.has(a) && selected.has(b) ? "#f5d76e" :
-          leftIds.has(a) ? "#50daf2" : "#f58cce";
+        ctx.strokeStyle = ghostMode
+          ? "rgba(255,255,255,.3)"
+          : selected.has(a) && selected.has(b)
+            ? "#f5d76e"
+            : leftIds.has(a) ? "#50daf2" : "#f58cce";
 
         ctx.lineWidth = 2.5 * scale;
         ctx.lineCap = "round";
@@ -1252,22 +1301,25 @@
         ctx.stroke();
       }
 
-      for (const idText of Object.keys(CM.posePointNames)) {
-        const id = Number(idText);
-        const point = points[id];
+      for (const text of Object.keys(CM.posePointNames)) {
+        const id = Number(text);
+        const p = points[id];
 
         if (
-          !sideAllows(id) || !CM.posePointValid(point) ||
+          !sideAllows(id) ||
+          !CM.posePointValid(p) ||
           (only && !selected.has(id))
         ) continue;
 
-        ctx.fillStyle = isGhost ? "rgba(255,255,255,.4)" :
-          point.manual || selected.has(id) ? "#f5d76e" :
-          leftIds.has(id) ? "#50daf2" : "#f58cce";
+        ctx.fillStyle = ghostMode
+          ? "rgba(255,255,255,.4)"
+          : p.manual || selected.has(id)
+            ? "#f5d76e"
+            : leftIds.has(id) ? "#50daf2" : "#f58cce";
 
         ctx.beginPath();
         ctx.arc(
-          point.x * width, point.y * height,
+          p.x * width, p.y * height,
           (selected.has(id) ? 5 : 3) * scale,
           0, Math.PI * 2
         );
@@ -1279,23 +1331,24 @@
       ctx.strokeStyle = color;
       ctx.lineWidth = Math.max(1.5, width / 500);
       ctx.beginPath();
-      let previousTime = null;
+
+      let previous = null;
 
       for (const sample of list) {
-        const point = getter(sample);
+        const p = getter(sample);
 
-        if (!point || !finite(point.x) || !finite(point.y)) {
-          previousTime = null;
+        if (!p || !finite(p.x) || !finite(p.y)) {
+          previous = null;
           continue;
         }
 
-        if (previousTime === null || sample.t - previousTime > 0.8) {
-          ctx.moveTo(point.x * width, point.y * height);
+        if (previous === null || sample.t - previous > 0.8) {
+          ctx.moveTo(p.x * width, p.y * height);
         } else {
-          ctx.lineTo(point.x * width, point.y * height);
+          ctx.lineTo(p.x * width, p.y * height);
         }
 
-        previousTime = sample.t;
+        previous = sample.t;
       }
 
       ctx.stroke();
@@ -1303,20 +1356,21 @@
 
     function draw() {
       if (!active) return;
+
       ctx.clearRect(0, 0, width, height);
       if (!source) return;
 
       const scale = Math.max(1, width / 800);
-      const time = timeNow();
-      const sample = nearest(time);
+      const t = timeNow();
+      const sample = nearest(t);
 
       if ($("#an-guides").checked) {
         const floor = clamp(Number($("#an-floor").value) || 0, 0, 100) / 100;
 
         ctx.save();
         ctx.strokeStyle = "rgba(255,255,255,.35)";
-        ctx.setLineDash([7 * scale, 5 * scale]);
         ctx.lineWidth = scale;
+        ctx.setLineDash([7 * scale, 5 * scale]);
         ctx.beginPath();
         ctx.moveTo(width / 2, 0);
         ctx.lineTo(width / 2, height);
@@ -1329,23 +1383,19 @@
       if ($("#an-ghost").checked && ghost) drawSkeleton(ghost, true);
 
       if ($("#an-trails").checked) {
-        const list = allSamples().filter(item =>
-          item.t >= time - 3 && item.t <= time
-        );
+        const recent = allSamples().filter(s => s.t >= t - 3 && s.t <= t);
 
         chosenParts().forEach((part, index) => {
-          const selectedSides = part === "pelvis" ? ["left"] : sides();
-
-          for (const side of selectedSides) {
+          for (const side of part === "pelvis" ? ["left"] : sides()) {
             drawTrail(
-              list,
+              recent,
               item => partPoint(item, part, side),
               colors[index % colors.length]
             );
           }
         });
 
-        drawTrail(list, item => item.bar, "#f5d76e");
+        drawTrail(recent, item => item.bar, "#f5d76e");
       }
 
       if (!sample) return;
@@ -1360,17 +1410,20 @@
 
           for (const side of part === "pelvis" ? ["left"] : sides()) {
             const value = partValue(sample, part, side, "angle");
-            const point = partPoint(sample, part, side);
-            if (!point || !finite(value)) continue;
+            const p = partPoint(sample, part, side);
+
+            if (!p || !finite(value)) continue;
 
             const text = `${value.toFixed(0)}°`;
             const textWidth = ctx.measureText(text).width;
+
             const x = clamp(
-              point.x * width + 8 * scale,
+              p.x * width + 8 * scale,
               0, Math.max(0, width - textWidth - 8 * scale)
             );
+
             const y = clamp(
-              point.y * height, 12 * scale, height - 12 * scale
+              p.y * height, 12 * scale, height - 12 * scale
             );
 
             ctx.fillStyle = "rgba(0,0,0,.7)";
@@ -1378,6 +1431,7 @@
               x - 3 * scale, y - 10 * scale,
               textWidth + 6 * scale, 20 * scale
             );
+
             ctx.fillStyle = "#f5d76e";
             ctx.fillText(text, x, y);
           }
@@ -1389,7 +1443,8 @@
         ctx.lineWidth = 2 * scale;
         ctx.beginPath();
         ctx.arc(
-          sample.bar.x * width, sample.bar.y * height,
+          sample.bar.x * width,
+          sample.bar.y * height,
           7 * scale, 0, Math.PI * 2
         );
         ctx.stroke();
@@ -1411,7 +1466,7 @@
         return manualReps.slice().sort((a, b) => a.start - b.start);
       }
 
-      if (currentExercise().mode !== "reps") return [];
+      if (exercise().mode !== "reps") return [];
       return CM.detectRepetitions(allSamples(), repConfig());
     }
 
@@ -1419,19 +1474,20 @@
       if (!active) return;
 
       const now = performance.now();
-      if (!force && now - lastGraphAt < 700) return;
+      if (!force && now - lastGraphAt < 800) return;
       lastGraphAt = now;
 
-      const time = timeNow();
-      const current = nearest(time);
+      const t = timeNow();
+      const current = nearest(t);
       const mode = $("#an-mode").value;
-      const smooth = $("#an-smoothing").value === "mean";
+      const meanMode = $("#an-smoothing").value === "mean";
       const unit = mode === "angle" ? "°" : "%";
+
       const list = source === "camera"
-        ? allSamples().filter(sample => sample.t >= time - 30)
+        ? allSamples().filter(sample => sample.t >= t - 30)
         : allSamples();
 
-      const series = [];
+      const chartSeries = [];
 
       chosenParts().forEach((part, index) => {
         for (const side of part === "pelvis" ? ["left"] : sides()) {
@@ -1442,79 +1498,92 @@
             y: partValue(sample, part, side, mode)
           }));
 
-          series.push({
+          chartSeries.push({
             name:
               (part === "pelvis" ? "" : side === "left" ? "왼 " : "오른 ") +
-              partNames[part],
+              parts[part],
             color: colors[index % colors.length],
             dash: side === "right" ? "6 4" : undefined,
-            data: smooth ? smoothData(data) : data
+            data: meanMode ? smooth(data) : data
           });
         }
       });
 
-      $("#an-chart").innerHTML = series.length
-        ? CM.lineChart(series, {
-            unit,
-            maxGap: 0.8,
-            currentTime: time
+      $("#an-chart").innerHTML = chartSeries.length
+        ? CM.lineChart(chartSeries, {
+            unit, maxGap: 0.8, currentTime: t
           })
         : CM.empty(
-            mode === "angle" && chosenParts().includes("wrist")
+            chosenParts().includes("wrist") && mode === "angle"
               ? "손목은 가로·세로 위치 그래프를 선택하세요."
               : "보고 싶은 부위를 선택하세요."
           );
 
       $("#an-graph-note").textContent = mode === "angle"
-        ? "관절은 2D 내부각, 몸통은 수직선 기준, 골반은 영상상 골반선 기울기입니다. 손목 굽힘각은 측정하지 않습니다."
+        ? "관절은 2D 내부각, 몸통은 수직선 기준, 골반은 영상상 골반선 기울기입니다."
         : mode === "x"
-          ? "영상 왼쪽 0% → 오른쪽 100%. 실제 이동 거리(cm)가 아닙니다."
-          : "영상 위쪽 0% → 아래쪽 100%. 카메라 이동도 값에 영향을 줍니다.";
+          ? "영상 왼쪽 0% → 오른쪽 100%. 실제 거리(cm)가 아닙니다."
+          : "영상 위쪽 0% → 아래쪽 100%. 실제 높이(cm)가 아닙니다.";
 
       $("#an-values").innerHTML = chosenParts().map(part => `
         <div class="metric">
-          <strong>${partNames[part]}</strong>
+          <strong>${parts[part]}</strong>
           ${(part === "pelvis" ? ["left"] : sides()).map(side => {
             const value = partValue(current, part, side, mode);
 
-            return `
-              <p>
-                ${part === "pelvis" ? "" : side === "left" ? "왼쪽 " : "오른쪽 "}
-                ${finite(value) ? value.toFixed(1) + unit : "측정 부족"}
-              </p>
-            `;
+            return `<p>
+              ${part === "pelvis" ? "" : side === "left" ? "왼쪽 " : "오른쪽 "}
+              ${finite(value) ? value.toFixed(1) + unit : "측정 부족"}
+            </p>`;
           }).join("")}
         </div>
       `).join("");
 
       if (current) {
-        const quality = current.quality?.status;
-        const validCount = Object.keys(CM.posePointNames).filter(id =>
+        const count = Object.keys(CM.posePointNames).filter(id =>
           CM.posePointValid(current.points?.[Number(id)])
         ).length;
 
-        $("#an-quality").textContent = quality === "multiple-people"
-          ? "여러 사람이 감지되어 이 프레임의 자동 측정을 보류했습니다."
-          : quality === "no-person" && !current.manual
-            ? "사람을 충분히 인식하지 못했습니다."
-            : `주요 기준점 ${validCount}/16개 사용 가능` +
-              (current.manual ? " · 수동 수정 포함" : "") +
-              " · 이 수치는 측정 정확도가 아닙니다.";
+        const quality = current.quality?.status;
+
+        $("#an-quality").textContent =
+          quality === "multiple-people" && !current.manual
+            ? "여러 사람이 감지되어 해당 프레임 측정을 보류했습니다."
+            : quality === "no-person" && !current.manual
+              ? "사람을 충분히 인식하지 못했습니다."
+              : `주요 기준점 ${count}/16개 사용 가능` +
+                (current.manual ? " · 수동 수정 포함" : "") +
+                " · 정확도 비율이 아닙니다.";
       } else {
-        $("#an-quality").textContent = "현재 시점의 분석 표본이 없습니다.";
+        $("#an-quality").textContent = "현재 시점의 측정 표본이 없습니다.";
       }
 
       const reps = repetitions();
 
       $("#an-rep-count").textContent =
-        `${reps.length}회 · ${manualReps.length ? "수동" : "자동·실험"}`;
+        `${reps.length}회 · ${
+          manualReps.length
+            ? "수동 구간"
+            : exercise().mode === "reps"
+              ? "자동 감지·실험"
+              : "수동 구간 사용"
+        }`;
+
+      $("#an-rep-bars").innerHTML = reps.length
+        ? CM.barChart(reps.slice(-20).map((rep, index) => ({
+            label: `${Math.max(0, reps.length - 20) + index + 1}회`,
+            name: `${Math.max(0, reps.length - 20) + index + 1}회`,
+            value: rep.end - rep.start,
+            color: "#f58cce"
+          })), "s")
+        : CM.empty("반복이 저장되면 수행 시간 막대 그래프가 생성됩니다.");
 
       $("#an-rep-list").innerHTML = reps.length ? `
         <div class="table-wrap">
           <table>
-            <thead>
-              <tr><th>반복</th><th>시작</th><th>종료</th><th>시간</th></tr>
-            </thead>
+            <thead><tr>
+              <th>반복</th><th>시작</th><th>종료</th><th>시간</th>
+            </tr></thead>
             <tbody>
               ${reps.slice(-20).map((rep, index) => `
                 <tr>
@@ -1527,124 +1596,70 @@
             </tbody>
           </table>
         </div>
-      ` : CM.empty("저장된 반복 구간이 없습니다.");
+      ` : "";
     }
 
-    function getRange() {
-      const start = Number($("#an-start").value);
-      const end = $("#an-end").value === ""
-        ? video.duration : Number($("#an-end").value);
+    function renderPhotos() {
+      if (!active) return;
 
-      if (
-        !finite(video.duration) || !finite(start) || !finite(end) ||
-        start < 0 || end <= start || end > video.duration + 0.05
-      ) throw new Error("영상 길이에 맞는 시작·종료 시간을 입력해 주세요.");
+      $("#an-photo-status").textContent =
+        `${photos.length}/12장 · ` +
+        `${photos.filter(p => p.captureType === "automatic").length}장 자동 캡처`;
 
-      return { start, end: Math.min(end, video.duration) };
-    }
-
-    async function seek(time) {
-      if (source !== "upload") return;
-      const target = clamp(time, 0, video.duration);
-
-      if (Math.abs(video.currentTime - target) < 0.001 && video.readyState >= 2) {
-        return;
-      }
-
-      await new Promise((resolve, reject) => {
-        const timeout = setTimeout(
-          () => finish(new Error("영상 탐색 시간이 초과되었습니다.")),
-          8000
-        );
-
-        function finish(error) {
-          clearTimeout(timeout);
-          video.removeEventListener("seeked", done);
-          video.removeEventListener("error", fail);
-          signal.removeEventListener("abort", abort);
-          if (error) reject(error);
-          else resolve();
-        }
-
-        function done() { finish(); }
-        function fail() { finish(new Error("영상 탐색에 실패했습니다.")); }
-        function abort() { finish(new Error("화면이 닫혔습니다.")); }
-
-        video.addEventListener("seeked", done, { once: true });
-        video.addEventListener("error", fail, { once: true });
-        signal.addEventListener("abort", abort, { once: true });
-        video.currentTime = target;
-      });
-    }
-
-    async function scan() {
-      if (source !== "upload" || busy || scanning || saving) return;
-      const range = getRange();
-
-      if (range.end - range.start > 600) {
-        throw new Error("한 번에 10분 이내의 구간을 선택해 주세요.");
-      }
-
-      scanning = true;
-      cancelScan = false;
-      pause();
-      $("#an-edit").value = "none";
-      syncUI();
-
-      try {
-        await ensureModel();
-        const total = Math.ceil((range.end - range.start) * 10);
-
-        for (let index = 0; index < total; index++) {
-          if (!active || cancelScan) break;
-
-          await seek(range.start + index / 10);
-          if (!active || cancelScan) break;
-
-          detect();
-
-          if (index % 5 === 0) {
-            draw();
-            updateGraph(true);
-            status(`구간 분석 ${Math.round((index + 1) / total * 100)}%`);
-            await new Promise(resolve => setTimeout(resolve, 0));
-          }
-        }
-
-        status(cancelScan
-          ? "중단했습니다. 완료된 분석값은 유지됩니다."
-          : "지정 구간 분석을 완료했습니다.");
-      } catch (error) {
-        inferenceFailed = true;
-        throw error;
-      } finally {
-        scanning = false;
-        syncUI();
-        draw();
-        updateGraph(true);
-      }
-    }
-
-    function renderSnapshots() {
-      $("#an-snapshots").innerHTML = snapshots.length
-        ? snapshots.map(item => `
+      $("#an-snapshots").innerHTML = photos.length
+        ? photos.map(photo => `
           <figure style="margin:0">
-            <img src="${esc(item.image)}" alt="동작 사진"
+            <img src="${esc(photo.image)}" alt="동작 사진"
               style="width:100%;border-radius:10px">
-            <figcaption class="row spread">
-              <span>${item.t.toFixed(2)}초</span>
-              <button data-delete-photo="${esc(item.id)}">삭제</button>
+            <figcaption class="row spread" style="gap:8px">
+              <span>
+                ${photo.captureType === "automatic" ? "자동" : "직접"}
+                · ${photo.t.toFixed(2)}초
+              </span>
+              <button data-remove-photo="${esc(photo.id)}">삭제</button>
             </figcaption>
           </figure>
         `).join("")
-        : CM.empty("저장할 동작 사진이 없습니다.");
+        : CM.empty("유효한 자세가 인식되면 자동 사진이 추가됩니다.");
     }
 
-    function snapshot() {
-      if (!source || video.readyState < 2) return;
-      if (snapshots.length >= 12) {
-        CM.toast("동작 사진은 최대 12장입니다.");
-        return;
+    function capturePhoto(type = "manual", finalFrame = false) {
+      if (!source || video.readyState < 2 || video.seeking) return false;
+
+      const t = timeNow();
+      const sample = nearest(t);
+
+      if (type === "automatic") {
+        if (!sample || sample.quality?.status !== "single-person") return false;
+
+        const validCount = Object.keys(CM.posePointNames).filter(id =>
+          CM.posePointValid(sample.points?.[Number(id)])
+        ).length;
+
+        if (validCount < 6) return false;
+        if (Math.abs(sample.t - t) > 0.12) return false;
+
+        if (photos.some(photo =>
+          photo.captureType === "automatic" && Math.abs(photo.t - t) < 0.3
+        )) return true;
+      }
+
+      let replaceIndex = -1;
+
+      if (photos.length >= 12) {
+        if (type === "automatic" && finalFrame) {
+          for (let i = photos.length - 1; i >= 0; i--) {
+            if (photos[i].captureType === "automatic") {
+              replaceIndex = i;
+              break;
+            }
+          }
+        }
+
+        if (replaceIndex < 0) {
+          if (type === "manual") CM.toast("사진은 최대 12장입니다.");
+          return false;
+        }
       }
 
       draw();
@@ -1654,19 +1669,171 @@
       output.width = Math.round(width * ratio);
       output.height = Math.round(height * ratio);
 
-      const outputContext = output.getContext("2d");
-      outputContext.drawImage(video, 0, 0, output.width, output.height);
-      outputContext.drawImage(canvas, 0, 0, output.width, output.height);
+      const context = output.getContext("2d");
+      context.drawImage(video, 0, 0, output.width, output.height);
+      context.drawImage(canvas, 0, 0, output.width, output.height);
 
-      snapshots.push({
+      const photo = {
         id: CM.uid(),
-        t: timeNow(),
-        image: output.toDataURL("image/jpeg", 0.85)
-      });
+        t,
+        image: output.toDataURL("image/jpeg", 0.82),
+        captureType: type,
+        captureLabel: type === "automatic"
+          ? finalFrame ? "종료 부근 유효 프레임" : "시간 간격 유효 프레임"
+          : "직접 캡처"
+      };
+
+      if (replaceIndex >= 0) photos[replaceIndex] = photo;
+      else photos.push(photo);
 
       dirty = true;
-      renderSnapshots();
-      CM.toast("사진을 추가했습니다. 분석 저장을 눌러 보관하세요.");
+      renderPhotos();
+
+      if (type === "manual") {
+        CM.toast("사진을 추가했습니다. 분석 저장 시 함께 보관합니다.");
+      }
+
+      return true;
+    }
+
+    function maybeAutoPhoto() {
+      if (!$("#an-auto-photo").checked || !source) return;
+
+      const t = timeNow();
+
+      if (scanning) {
+        if (
+          scanPhotoIndex < scanPhotoTargets.length &&
+          t >= scanPhotoTargets[scanPhotoIndex] &&
+          capturePhoto("automatic")
+        ) {
+          // 이미 지나간 목표 시점을 한 번에 정리합니다.
+          while (
+            scanPhotoIndex < scanPhotoTargets.length &&
+            scanPhotoTargets[scanPhotoIndex] <= t
+          ) scanPhotoIndex++;
+        }
+
+        return;
+      }
+
+      if (video.paused || photos.length >= 11) return;
+
+      if (t >= nextCameraPhotoAt && capturePhoto("automatic")) {
+        const interval = source === "camera"
+          ? Number($("#an-photo-interval").value)
+          : finite(video.duration)
+            ? Math.max(1, video.duration / 10)
+            : 5;
+
+        nextCameraPhotoAt = t + interval;
+      }
+    }
+
+    function getRange() {
+      const start = Number($("#an-start").value);
+      const end = $("#an-end").value === ""
+        ? video.duration : Number($("#an-end").value);
+
+      if (
+        !finite(video.duration) ||
+        !finite(start) || !finite(end) ||
+        start < 0 || end <= start || end > video.duration + 0.05
+      ) {
+        throw new Error("영상 길이에 맞는 시작·종료 시간을 입력해 주세요.");
+      }
+
+      return { start, end: Math.min(end, video.duration) };
+    }
+
+    async function seek(t) {
+      if (source !== "upload") return;
+
+      const target = clamp(t, 0, video.duration);
+
+      if (
+        Math.abs(video.currentTime - target) < 0.001 &&
+        video.readyState >= 2
+      ) return;
+
+      await videoEvent("seeked", () => {
+        video.currentTime = target;
+      }, 8000);
+    }
+
+    async function scanVideo() {
+      if (source !== "upload" || locked()) return;
+
+      const range = getRange();
+
+      if (range.end - range.start > 600) {
+        throw new Error("한 번에 분석할 구간은 10분 이내로 선택하세요.");
+      }
+
+      scanning = true;
+      cancelScan = false;
+      inferenceFailed = false;
+      pause();
+      $("#an-edit").value = "none";
+
+      const duration = range.end - range.start;
+
+      scanPhotoTargets = Array.from({ length: 11 }, (_, index) =>
+        range.start + duration * index / 11
+      );
+
+      scanPhotoIndex = 0;
+      syncUI();
+
+      let complete = false;
+
+      try {
+        await ensureModel();
+
+        const total = Math.max(1, Math.ceil(duration * 10));
+
+        for (let index = 0; index < total; index++) {
+          if (!active || cancelScan) break;
+
+          const t = range.start + index / 10;
+          if (t >= range.end) break;
+
+          await seek(t);
+          if (!active || cancelScan) break;
+
+          detect();
+          maybeAutoPhoto();
+
+          if (index % 5 === 0) {
+            draw();
+            updateGraph(true);
+            status(`구간 분석 ${Math.round((index + 1) / total * 100)}%`);
+            await new Promise(resolve => setTimeout(resolve, 0));
+          }
+        }
+
+        complete = active && !cancelScan;
+
+        if (complete && $("#an-auto-photo").checked) {
+          capturePhoto("automatic", true);
+        }
+
+        status(complete
+          ? "지정 구간 분석 완료"
+          : "분석을 중단했습니다. 완료된 분석값은 유지합니다.");
+      } catch (error) {
+        inferenceFailed = true;
+        throw error;
+      } finally {
+        scanning = false;
+        syncUI();
+        draw();
+        updateGraph(true);
+      }
+
+      if (complete && $("#an-auto-finish").checked) {
+        await finishMeasurement();
+      }
     }
 
     function rememberEdit(key, before, after) {
@@ -1675,20 +1842,22 @@
         before: before ? copy(before) : null,
         after: after ? copy(after) : null
       });
+
       if (undo.length > 40) undo.shift();
       redo.length = 0;
-      changeData();
+      changed();
       syncUI();
     }
 
     function finishDrag() {
       if (!drag) return;
+
       rememberEdit(drag.key, drag.before, samples.get(drag.key));
       drag = null;
       updateGraph(true);
     }
 
-    function editPointer(event) {
+    function editAt(event) {
       if (!drag) return;
 
       const rect = canvas.getBoundingClientRect();
@@ -1713,18 +1882,18 @@
       draw();
     }
 
-    function applyEdit(item, key) {
-      if (item[key]) samples.set(item.key, copy(item[key]));
+    function applyEdit(item, version) {
+      if (item[version]) samples.set(item.key, copy(item[version]));
       else samples.delete(item.key);
 
-      changeData();
+      changed();
       syncUI();
       draw();
       updateGraph(true);
     }
 
-    function optionalNumber(id) {
-      const node = $(id);
+    function optionalNumber(selector) {
+      const node = $(selector);
       if (node.value.trim() === "") return null;
 
       if (!node.checkValidity() || !finite(Number(node.value))) {
@@ -1734,11 +1903,12 @@
       return Number(node.value);
     }
 
-    async function save(openReport = false) {
-      if (busy || scanning || saving) return;
+    async function saveRecord() {
+      if (busy || scanning || saving) return false;
+
       if (!samples.size) {
         CM.toast("저장할 분석값이 없습니다.");
-        return;
+        return false;
       }
 
       pause();
@@ -1749,18 +1919,20 @@
       const config = repConfig();
 
       if (
-        currentExercise().mode === "reps" &&
+        exercise().mode === "reps" &&
         !(config.low >= 0 && config.high <= 180 && config.low < config.high)
-      ) throw new Error("반복 감지 각도 기준을 확인해 주세요.");
+      ) {
+        throw new Error("자동 반복 감지 각도 기준을 확인해 주세요.");
+      }
 
       const range = source === "upload" ? getRange() : null;
       saving = true;
       syncUI();
-      let createdMediaId = null;
-      let completed = false;
+
+      let newMediaId = null;
 
       try {
-        const existing = savedId
+        const previous = savedId
           ? await CM.db.get("records", savedId)
           : null;
 
@@ -1768,12 +1940,12 @@
           source === "upload" &&
           sourceFile &&
           $("#an-keep-media").checked &&
-          !savedMediaId
+          !mediaId
         ) {
-          createdMediaId = CM.uid();
+          newMediaId = CM.uid();
 
           await CM.db.put("media", {
-            id: createdMediaId,
+            id: newMediaId,
             blob: sourceFile,
             name: sourceFile.name,
             type: sourceFile.type,
@@ -1782,21 +1954,21 @@
         }
 
         const athleteId = $("#an-athlete").value;
-        const athlete = athletes.find(item => item.id === athleteId);
-        const exercise = currentExercise();
+        const athlete = athletes.find(a => a.id === athleteId);
+        const selectedExercise = exercise();
         const now = new Date().toISOString();
 
         const record = {
-          ...(existing || {}),
+          ...(previous || {}),
           id: savedId || CM.uid(),
           athleteId,
           athleteName: athlete?.name || "게스트",
-          exerciseId: exercise.id,
-          exercise: { ...exercise },
+          exerciseId: selectedExercise.id,
+          exercise: { ...selectedExercise },
           view: $("#an-view").value,
           weight,
           targetReps,
-          createdAt: recordCreatedAt || existing?.createdAt || now,
+          createdAt: createdAt || previous?.createdAt || now,
           updatedAt: now,
           width,
           height,
@@ -1808,19 +1980,19 @@
           repetitionConfig: config,
           repetitionSource: manualReps.length
             ? "manual"
-            : exercise.mode === "reps" ? "experimental-auto" : "none",
+            : selectedExercise.mode === "reps" ? "experimental-auto" : "none",
           range,
-          snapshots: snapshots.slice(),
+          snapshots: photos.slice(),
           memo: $("#an-memo").value.trim(),
-          coachFeedback: existing?.coachFeedback || "",
-          mediaId: createdMediaId || savedMediaId || existing?.mediaId || null,
+          coachFeedback: previous?.coachFeedback || "",
+          mediaId: newMediaId || mediaId || previous?.mediaId || null,
           measurementVersion: "2d-v2",
           angleDefinition: "three-point-internal-angle",
           barTracking: "manual",
           clinicalValidation: false,
           poseConfig: {
             packageVersion: "0.10.18",
-            model: modelName,
+            model: loadedModelName,
             runningMode: "IMAGE",
             visibilityThreshold: Number($("#an-threshold").value),
             maxDetectedPeople: 2,
@@ -1828,42 +2000,74 @@
             rawPointsStored: true,
             measurementSmoothing: false,
             plannedSampleRate: 10
+          },
+          captureConfig: {
+            automaticEnabled: $("#an-auto-photo").checked,
+            cameraIntervalSeconds: Number($("#an-photo-interval").value),
+            type: "time-sampled-valid-frames",
+            maxPhotos: 12
           }
         };
 
         await CM.db.put("records", record);
 
         savedId = record.id;
-        savedMediaId = record.mediaId;
-        recordCreatedAt = record.createdAt;
-        createdMediaId = null;
+        mediaId = record.mediaId;
+        createdAt = record.createdAt;
+        newMediaId = null;
         dirty = false;
-        completed = true;
 
         CM.selectedRecord = record.id;
         CM.selectedAthlete = athleteId;
-        CM.selectedExercise = exercise.id;
+        CM.selectedExercise = selectedExercise.id;
 
-        status("저장 완료 · 재생을 계속하면 변경 사항이 추가됩니다.");
+        status("분석값과 동작 사진을 저장했습니다.");
         CM.toast("분석 기록을 저장했습니다.");
+        return true;
       } catch (error) {
-        if (createdMediaId) {
+        if (newMediaId) {
           try {
-            await CM.db.remove("media", createdMediaId);
+            await CM.db.remove("media", newMediaId);
           } catch (cleanupError) {
             console.warn(cleanupError);
           }
         }
+
         throw error;
       } finally {
         saving = false;
         syncUI();
       }
+    }
 
-      if (completed && openReport) location.hash = "reports";
+    async function finishMeasurement() {
+      if (locked()) return;
+
+      finishing = true;
+      syncUI();
+      let completed = false;
+
+      try {
+        pause();
+        finishDrag();
+
+        if ($("#an-auto-photo").checked) {
+          capturePhoto("automatic", true);
+        }
+
+        completed = await saveRecord();
+      } finally {
+        finishing = false;
+        syncUI();
+      }
+
+      if (completed && active) {
+        location.hash = "reports";
+      }
     }
 
     on("#an-camera", "click", () => openCamera(facing));
+
     on("#an-switch", "click", () =>
       openCamera(facing === "user" ? "environment" : "user")
     );
@@ -1893,6 +2097,7 @@
       }
 
       $("#an-edit").value = "none";
+      videoAutoFinished = false;
 
       if (source === "upload" && video.currentTime >= video.duration - 0.05) {
         await seek($("#an-loop").checked ? getRange().start : 0);
@@ -1902,7 +2107,7 @@
     });
 
     async function step(delta) {
-      if (source !== "upload" || busy || scanning || saving) return;
+      if (source !== "upload" || locked()) return;
       pause();
       await seek(timeNow() + delta);
       detect();
@@ -1914,7 +2119,7 @@
     on("#an-next", "click", () => step(0.1));
 
     on("#an-seek", "change", async event => {
-      if (busy || scanning || saving) return;
+      if (locked()) return;
       pause();
       await seek(Number(event.target.value));
       detect();
@@ -1927,27 +2132,33 @@
     });
 
     on("#an-video", "seeked", () => {
-      if (busy || scanning || saving) return;
+      if (locked()) return;
       detect();
       draw();
       updateGraph(true);
     });
 
     on("#an-video", "ended", async () => {
-      if (
-        source === "upload" && $("#an-loop").checked &&
-        !busy && !scanning && !saving
-      ) {
+      if (source !== "upload" || locked()) return;
+
+      if ($("#an-loop").checked) {
         await seek(getRange().start);
         await play();
+        return;
+      }
+
+      if ($("#an-auto-finish").checked && !videoAutoFinished) {
+        videoAutoFinished = true;
+        await finishMeasurement();
       }
     });
 
-    on("#an-scan", "click", scan);
+    on("#an-scan", "click", scanVideo);
     on("#an-cancel", "click", () => { cancelScan = true; });
-    on("#an-snapshot", "click", snapshot);
-    on("#an-save", "click", () => save(false));
-    on("#an-report", "click", () => save(true));
+    on("#an-save", "click", () => saveRecord());
+    on("#an-finish", "click", finishMeasurement);
+    on("#an-snapshot", "click", () => capturePhoto("manual"));
+
     on("#an-memo", "input", () => { dirty = true; });
 
     on("#an-edit", "change", event => {
@@ -1961,14 +2172,15 @@
 
     on("#an-canvas", "pointerdown", event => {
       const mode = $("#an-edit").value;
-      if (!source || mode === "none" || busy || scanning || saving) return;
+      if (!source || mode === "none" || locked()) return;
 
       pause();
+
       const t = timeNow();
       const key = keyOf(t);
-      const before = samples.get(key);
+      const previous = samples.get(key);
 
-      const sample = before ? copy(before) : {
+      const sample = previous ? copy(previous) : {
         t,
         rawPoints: Array(33).fill(null),
         points: Array(33).fill(null),
@@ -1976,28 +2188,28 @@
         metrics: {},
         manual: true,
         bar: null,
-        quality: { status: "manual", visibilityThreshold: null }
+        quality: { status: "manual" }
       };
 
       drag = {
         key,
-        before: before ? copy(before) : null,
+        before: previous ? copy(previous) : null,
         sample,
         mode,
         point: Number($("#an-point").value)
       };
 
       canvas.setPointerCapture(event.pointerId);
-      editPointer(event);
+      editAt(event);
     });
 
-    on("#an-canvas", "pointermove", editPointer);
+    on("#an-canvas", "pointermove", editAt);
     on("#an-canvas", "pointerup", finishDrag);
     on("#an-canvas", "pointercancel", finishDrag);
     on("#an-canvas", "lostpointercapture", finishDrag);
 
     on("#an-undo", "click", () => {
-      if (busy || scanning || saving) return;
+      if (locked()) return;
       finishDrag();
       const item = undo.pop();
       if (!item) return;
@@ -2006,7 +2218,7 @@
     });
 
     on("#an-redo", "click", () => {
-      if (busy || scanning || saving) return;
+      if (locked()) return;
       const item = redo.pop();
       if (!item) return;
       undo.push(item);
@@ -2014,7 +2226,7 @@
     });
 
     on("#an-clear-bar", "click", () => {
-      if (busy || scanning || saving) return;
+      if (locked()) return;
       pause();
 
       const key = keyOf(timeNow());
@@ -2045,13 +2257,13 @@
     });
 
     on("#an-mark-start", "click", () => {
-      if (!source || busy || scanning || saving) return;
+      if (!source || locked()) return;
       markStart = timeNow();
       $("#an-mark-label").textContent = `시작 ${markStart.toFixed(2)}초`;
     });
 
     on("#an-mark-end", "click", () => {
-      if (!source || busy || scanning || saving) return;
+      if (!source || locked()) return;
       const end = timeNow();
 
       if (!finite(markStart) || end <= markStart) {
@@ -2078,33 +2290,33 @@
     });
 
     on("#an-remove-rep", "click", () => {
-      if (busy || scanning || saving || !manualReps.length) return;
+      if (locked() || !manualReps.length) return;
       manualReps.pop();
       dirty = true;
       updateGraph(true);
     });
 
     on("#an-clear-reps", "click", () => {
-      if (busy || scanning || saving || !manualReps.length) return;
-      if (!window.confirm("수동 반복 구간을 모두 지울까요?")) return;
+      if (locked() || !manualReps.length) return;
+      if (!window.confirm("수동 구간을 모두 지울까요?")) return;
+
       manualReps.length = 0;
       dirty = true;
       updateGraph(true);
     });
 
     on("#an-snapshots", "click", event => {
-      if (busy || scanning || saving) return;
-      const item = event.target.closest("[data-delete-photo]");
-      if (!item) return;
+      if (locked()) return;
 
-      const index = snapshots.findIndex(
-        photo => photo.id === item.dataset.deletePhoto
-      );
+      const button = event.target.closest("[data-remove-photo]");
+      if (!button) return;
+
+      const index = photos.findIndex(p => p.id === button.dataset.removePhoto);
 
       if (index >= 0) {
-        snapshots.splice(index, 1);
+        photos.splice(index, 1);
         dirty = true;
-        renderSnapshots();
+        renderPhotos();
       }
     });
 
@@ -2127,7 +2339,8 @@
     });
 
     for (const id of [
-      "an-rep-key", "an-low", "an-high", "an-start", "an-end", "an-keep-media"
+      "an-rep-key", "an-low", "an-high",
+      "an-start", "an-end", "an-keep-media"
     ]) {
       on(`#${id}`, "change", () => {
         if (samples.size) dirty = true;
@@ -2135,12 +2348,16 @@
       });
     }
 
-    function chooseExerciseMetric() {
-      const exercise = currentExercise();
-      const metric = Object.hasOwn(jointNames, exercise.metric)
-        ? exercise.metric : "knee";
+    on("#an-auto-photo", "change", () => {
+      nextCameraPhotoAt = timeNow();
+    });
 
-      CM.selectedExercise = exercise.id;
+    function chooseExerciseMetric() {
+      const selected = exercise();
+      const metric = Object.hasOwn(joints, selected.metric)
+        ? selected.metric : "knee";
+
+      CM.selectedExercise = selected.id;
       $("#an-rep-key").value = `left_${metric}`;
 
       main.querySelectorAll("[data-part]").forEach(node => {
@@ -2152,12 +2369,12 @@
 
     on("#an-exercise", "change", chooseExerciseMetric);
 
-    const unbindChart = CM.bindChartSeek($("#an-chart"), async time => {
-      if (source !== "upload" || busy || scanning || saving) return;
+    const unbindChart = CM.bindChartSeek($("#an-chart"), async t => {
+      if (source !== "upload" || locked()) return;
 
       try {
         pause();
-        await seek(time);
+        await seek(t);
         detect();
         draw();
         updateGraph(true);
@@ -2171,15 +2388,17 @@
 
       try {
         if (
-          source && !busy && !scanning && !saving &&
+          source && !locked() &&
           !video.paused && !video.seeking && video.readyState >= 2
         ) {
           if (source === "upload" && $("#an-loop").checked) {
             try {
               const range = getRange();
 
-              if (video.currentTime >= range.end ||
-                  video.currentTime < range.start) {
+              if (
+                video.currentTime >= range.end ||
+                video.currentTime < range.start
+              ) {
                 video.currentTime = range.start;
               }
             } catch {
@@ -2189,12 +2408,13 @@
           }
 
           if (
-            now - lastDetectionAt >= 100 &&
+            now - lastDetectAt >= 100 &&
             video.currentTime !== lastVideoTime
           ) {
-            lastDetectionAt = now;
+            lastDetectAt = now;
             lastVideoTime = video.currentTime;
             detect();
+            maybeAutoPhoto();
           }
         }
 
@@ -2214,7 +2434,7 @@
     }
 
     window.addEventListener("beforeunload", event => {
-      if (!dirty && !busy && !scanning && !saving) return;
+      if (!dirty && !locked()) return;
       event.preventDefault();
       event.returnValue = "";
     }, { signal });
@@ -2227,7 +2447,7 @@
     }, { signal });
 
     CM.analysisCanLeave = () => {
-      if (busy || saving) {
+      if (busy || saving || finishing) {
         CM.toast("진행 중인 작업이 끝난 뒤 이동하세요.");
         return false;
       }
@@ -2249,16 +2469,19 @@
       cancelScan = true;
       cancelAnimationFrame(raf);
       controller.abort();
+
       if (typeof unbindChart === "function") unbindChart();
+
       releaseSource();
       model?.close();
       model = null;
+
       CM.analysisCanLeave = null;
       CM.analysisCleanup = null;
     };
 
     chooseExerciseMetric();
-    renderSnapshots();
+    renderPhotos();
     syncUI();
     raf = requestAnimationFrame(tick);
   };
